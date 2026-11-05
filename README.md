@@ -138,3 +138,24 @@ compact (12px content, 13px headings) and does not open extra settings pages.
 It remains an X11 prototype; real GTK rendering and focus behavior still
 require interactive testing on Debian/KDE. No private screens or OCR logs
 are committed by this patch.
+
+## Window-height and compact GTK layout fix (patch 0005)
+
+On some KDE/GTK4 configurations, the previous plain `Gtk.Grid` propagated
+its natural minimum height (e.g. 733px) into an allocated window height of
+718px, causing repeated `Trying to measure AdwApplicationWindow ...` warnings.
+This is a layout-measurement warning, not an OCR/Codex failure.
+
+The two columns now sit in a single vertical `Gtk.ScrolledWindow` with
+`propagate_natural_height=False` and a bounded minimum height. The status
+strip, playback controls, and action buttons remain visible even when the
+window is shorter than the full settings content. Smaller row gaps, frame
+padding, and logger minimum height are intended to fit all settings at the
+default 1160×700 size; an internal scrollbar appears only as needed for
+font scaling, window-manager decorations, and unusually small displays.
+The layout is still one page, with no extra dialogs or tabs.
+
+This patch does not modify the Codex automation engine, time scheduling, or
+any private OCR reference. For users with large fonts/display scaling, the
+settings may require vertical scrolling; Gtk must never truncate buttons or
+warn about an impossible minimum window height.

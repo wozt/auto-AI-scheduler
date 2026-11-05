@@ -29,13 +29,14 @@ TRANSPORT_CONTROLS = ('previous', 'play', 'pause', 'stop', 'next')
 COMPACT_CSS = b"""
 .scheduler-root { font-size: 12px; }
 .scheduler-root label { font-size: 12px; }
-.scheduler-section { border-radius: 9px; }
+.scheduler-section { border-radius: 8px; }
+.scheduler-settings-viewport { background: transparent; }
 .scheduler-section .scheduler-title { font-weight: 700; font-size: 13px; }
 .scheduler-section .scheduler-hint { font-size: 11px; opacity: 0.8; }
-.scheduler-row { min-height: 26px; }
-.scheduler-row entry { min-height: 25px; padding: 1px 7px; }
-.scheduler-row spinbutton { min-height: 25px; }
-.scheduler-row dropdown button { min-height: 25px; padding: 1px 6px; }
+.scheduler-row { min-height: 24px; }
+.scheduler-row entry { min-height: 23px; padding: 0px 6px; }
+.scheduler-row spinbutton { min-height: 23px; }
+.scheduler-row dropdown button { min-height: 23px; padding: 0px 6px; }
 .scheduler-row switch { margin: 0px; }
 .scheduler-controls button, .scheduler-tools button { min-height: 29px; padding: 3px 11px; }
 .scheduler-state { padding: 6px 11px; border-radius: 7px;
@@ -87,9 +88,9 @@ def launch():
             frame = Gtk.Frame()
             frame.add_css_class('scheduler-section')
             frame.set_hexpand(True)
-            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
             for side in ('start', 'end', 'top', 'bottom'):
-                getattr(content, f'set_margin_{side}')(7)
+                getattr(content, f'set_margin_{side}')(5)
             heading = Gtk.Label(label=title, xalign=0)
             heading.add_css_class('scheduler-title')
             content.append(heading)
@@ -101,7 +102,7 @@ def launch():
             return frame, content
 
         def _field(self, panel, key, title, kind='text', bounds=None):
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
             row.add_css_class('scheduler-row')
             caption = Gtk.Label(label=title, xalign=0)
             caption.set_hexpand(True)
@@ -150,7 +151,10 @@ def launch():
             self.window = win
             win.set_title('Auto AI Scheduler')
             win.set_default_size(1160, 700)
-            win.set_size_request(1010, 635)
+            # Request only a modest minimum. GTK can otherwise demand the
+            # entire natural height of every setting row (733px+ on KDE).
+            # The settings viewport below handles smaller allocations safely.
+            win.set_size_request(910, 480)
 
             css = Gtk.CssProvider()
             css.load_from_data(COMPACT_CSS)
@@ -159,10 +163,10 @@ def launch():
 
             toolbar = Adw.ToolbarView()
             toolbar.add_top_bar(Adw.HeaderBar())
-            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
             root.add_css_class('scheduler-root')
             for side in ('start', 'end', 'top', 'bottom'):
-                getattr(root, f'set_margin_{side}')(9)
+                getattr(root, f'set_margin_{side}')(6)
             toolbar.set_content(root)
             win.set_content(toolbar)
 
@@ -194,13 +198,26 @@ def launch():
             self._button(transports, 'next', '⏭ Suivante (aperçu)', self.next,
                          'Voir la prochaine action anticipée. Ne lance aucun prompt.')
 
-            columns = Gtk.Grid(column_spacing=10)
+            # Critical fix: a plain Grid forces the window's minimum height
+            # to include every control on the tallest column. A ScrolledWindow
+            # gives the single-page dashboard a bounded minimum instead.
+            # On a normal 1160x700 window, compact margins keep the settings
+            # visible together; on smaller screens only this area scrolls.
+            viewport = Gtk.ScrolledWindow()
+            viewport.add_css_class('scheduler-settings-viewport')
+            viewport.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            viewport.set_propagate_natural_height(False)
+            viewport.set_min_content_height(280)
+            viewport.set_vexpand(True)
+            viewport.set_hexpand(True)
+            root.append(viewport)
+
+            columns = Gtk.Grid(column_spacing=8)
             columns.set_column_homogeneous(True)
             columns.set_hexpand(True)
-            columns.set_vexpand(True)
-            root.append(columns)
-            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
-            right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+            viewport.set_child(columns)
+            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
             left.set_hexpand(True)
             right.set_hexpand(True)
             columns.attach(left, 0, 0, 1, 1)
@@ -230,7 +247,7 @@ def launch():
             self.history_label.add_css_class('scheduler-event')
             panel.append(self.history_label)
             pane = Gtk.ScrolledWindow(vexpand=True)
-            pane.set_min_content_height(92)
+            pane.set_min_content_height(65)
             self.logs = Gtk.TextView(editable=False, cursor_visible=False,
                                      monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
             self.logs.add_css_class('scheduler-log')
