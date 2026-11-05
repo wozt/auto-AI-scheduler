@@ -100,11 +100,19 @@ class Scheduler:
         self.log(f'Project {self.config["project"]!r} with Codex not found: no action')
         return None
 
-    def send(self, reason='manual'):
+    def send(self, reason='manual', *, prompt_override=None):
         """Single verified send, never from a stale or unrecognized chat."""
         if self.force_test_pending:
             self.log('Force test in progress: regular send blocked')
             return False
+        if reason == 'workflow':
+            if self.session.waiting_for_response or self.pending_approval:
+                self.log('Unfinished cycle or pending approval: workflow send blocked')
+                return False
+            if not isinstance(prompt_override, str) or not prompt_override.strip() or \
+               '\n' in prompt_override or len(prompt_override) > 4000:
+                self.log('Invalid workflow prompt')
+                return False
         if self.session.cycles >= self.config['max_cycles']:
             self.log('Cycle limit reached')
             return False
@@ -126,7 +134,7 @@ class Scheduler:
                 if not self.claims.claim(key):
                     self.log('Scheduled prompt already claimed; no duplicate send')
                     return
-            x11.type_and_send(wid,abs_xy,self.config['prompt'])
+            x11.type_and_send(wid,abs_xy,prompt_override if reason == 'workflow' else self.config['prompt'])
             self.session.last_sent = time.monotonic()
             self.session.baseline_marker = obs.cycle_marker
             self.session.waiting_for_response = True
@@ -184,13 +192,15 @@ class Scheduler:
                              f'Project: {self.config["project"]}\nThis was an isolated test, not a scheduled cycle.')
         return success
 
-    def scroll(self):
+    def scroll(self, *, steps_override=None):
+        if steps_override is not None and not (isinstance(steps_override, int) and 1 <= steps_override <= 80):
+            return False
         did_scroll = False
         def perform(wid,obs,offset):
             nonlocal did_scroll
             if obs.scroll_anchor:
                 x11.scroll_down((offset[0]+obs.scroll_anchor[0],offset[1]+obs.scroll_anchor[1]),
-                                self.config['scroll_steps'])
+                                self.config['scroll_steps'] if steps_override is None else steps_override)
                 did_scroll=True
         self.inspect_target(perform)
         return did_scroll

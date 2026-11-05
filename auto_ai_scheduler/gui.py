@@ -1,7 +1,7 @@
-"""Resizable GTK4 visual scenario editor with a bottom timeline.
+"""Resizable GTK4 visual scenario editor and guarded timeline executor.
 
-The graph is an authoring/verification workspace: it is never executed by this
-UI. The legacy Scheduler is still the only component that can send to Codex.
+The graph runner only dispatches through Scheduler; explicit Scénario Play is
+required. The legacy monitor and workflow executor never run simultaneously.
 """
 from datetime import datetime
 from uuid import uuid4
@@ -10,6 +10,7 @@ from . import config, display, x11
 from .control import RunControls, next_action, recent_target
 from .engine import Scheduler
 from .workflow import NODE_KINDS, WorkflowStore, planned_send
+from .workflow_run import WorkflowRunner
 from .proofs import ProofStore
 from . import editor
 
@@ -69,6 +70,9 @@ def launch():
             self.workflow_store=WorkflowStore()
             self.proof_store=ProofStore()
             self.graph=self.workflow_store.load()
+            self.runner=WorkflowRunner(self.engine,self.proof_store,self.log)
+            self._displayed_step=None
+            self.runner_label=None
             self.selected=None
             self.window=None
             self.status=None
@@ -208,9 +212,9 @@ def launch():
             vertical.set_end_child(self.make_timeline())
             vertical.set_position(max(340,self.cfg['window_height']-310))
 
-            self.status=Gtk.Label(label='Inactif · Play démarre le superviseur, pas le graphe.',xalign=0)
+            self.status=Gtk.Label(label='Inactif · Play surveille Codex ; ▶ Scénario lance la timeline validée.',xalign=0)
             self.status.set_ellipsize(Pango.EllipsizeMode.END)
-            self.status.set_tooltip_text('Le graphe se sauvegarde et se teste en mode non exécutable pour le moment.')
+            self.status.set_tooltip_text('Exécution des scénarios seulement via ▶ Scénario, après validation du déclencheur et des preuves. Aucun démarrage automatique.')
             root.append(self.status)
             self.select_node(self.graph.nodes[0].id if self.graph.nodes else None)
             self.refresh()
@@ -233,7 +237,7 @@ def launch():
             wrap=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=7)
             wrap.add_css_class('scheduler-panel')
             wrap.set_size_request(190,-1)
-            wrap.append(self.section_title('Bibliothèque de blocs','Ajouter des étapes au scénario (sans exécution immédiate)'))
+            wrap.append(self.section_title('Bibliothèque de blocs','Ajouter des étapes au scénario ; elles ne s’exécutent que par ▶ Scénario'))
             scroll=Gtk.ScrolledWindow()
             scroll.set_vexpand(True)
             wrap.append(scroll)
@@ -283,6 +287,23 @@ def launch():
         def make_timeline(self):
             lower=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=4)
             lower.add_css_class('scheduler-timeline')
+            bar=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=6)
+            lower.append(bar)
+            bar.append(Gtk.Label(label='EXÉCUTION DU SCÉNARIO',xalign=0))
+            for label,method,help_text in (
+                ('▶ Scénario',self.workflow_start,'Armer un scénario validé. N’envoie rien tant que le déclencheur et les conditions ne sont pas vérifiés.'),
+                ('⏸ Scénario',self.workflow_pause,'Suspendre la timeline et toute action de ce scénario.'),
+                ('■ Scénario',self.workflow_stop,'Arrêter le scénario, sans reprendre le superviseur classique.'),
+            ):
+                btn=Gtk.Button(label=label)
+                btn.set_tooltip_text(help_text)
+                btn.connect('clicked',method)
+                bar.append(btn)
+            self.runner_label=Gtk.Label(label='Scénario inactif',xalign=1)
+            self.runner_label.set_hexpand(True)
+            self.runner_label.set_ellipsize(Pango.EllipsizeMode.END)
+            self.runner_label.set_tooltip_text('Indique le bloc en attente ou en cours. Les scénarios sont exécutés uniquement après un clic sur Scénario.')
+            bar.append(self.runner_label)
             timeline,reload=self._timeline_components()
             self.timeline_reload=reload
             timeline.set_vexpand(True)
@@ -303,7 +324,8 @@ def launch():
             return lower
 
         def _timeline_components(self):
-            return editor.timeline_widget(Gtk,self.graph,self.proof_store,self.select_node)
+            return editor.timeline_widget(Gtk,self.graph,self.proof_store,self.select_node,
+                                          active_id=lambda: self.runner.current.id if self.runner.phase in ('running','paused','approval') and self.runner.current else None)
 
         def graph_changed(self):
             self.workflow_store.save(self.graph)
@@ -437,7 +459,7 @@ def launch():
 
         def save_workflow(self,*_):
             self.graph_changed()
-            self.log('Scénario sauvegardé localement (non exécuté).')
+            self.log('Scénario sauvegardé localement. Un clic sur ▶ Scénario est requis pour exécuter.')
 
         def open_preferences(self,*_):
             if self.display_settings is not None:
@@ -553,10 +575,16 @@ def launch():
             else:self.log(f'Projet confirmé · Codex {obs.state}')
 
         def send(self,*_):
+            if self.runner.phase in ('running','paused','approval'):
+                self.log('Envoi manuel interdit pendant un scénario armé ; arrêtez-le d’abord')
+                return
             if not self.engine.send('manual'):
                 self.log('Envoi manuel refusé (état, quota, projet ou cooldown)')
 
         def force_test(self,*_):
+            if self.runner.phase in ('running','paused','approval'):
+                self.log('Force test indépendant : arrêtez le scénario avant tout envoi')
+                return
             node = planned_send(self.graph, self.selected)
             if node is None:
                 self.log('Force test : ajoutez un bloc « Envoyer prompt » au scénario')
@@ -587,8 +615,31 @@ def launch():
             dialog.connect('response', chosen)
             dialog.present()
 
+        def workflow_start(self,*_):
+            try:
+                if self.runner.phase == 'paused':
+                    self.runner.resume()
+                else:
+                    if self.controls.phase == 'running':
+                        self.controls.stop()
+                    self.runner.start(self.graph)
+                self.refresh()
+            except ValueError as exc:
+                self.log('Scénario refusé : ' + str(exc))
+
+        def workflow_pause(self,*_):
+            self.runner.pause()
+            self.refresh()
+
+        def workflow_stop(self,*_):
+            self.runner.stop()
+            self.refresh()
+
         def play(self,*_):
-            if self.controls.play():self.log('Surveillance Codex démarrée · graphe en édition uniquement')
+            if self.runner.phase in ('running','paused','approval'):
+                self.log('Arrêtez le scénario avant de lancer le superviseur classique')
+                return
+            if self.controls.play():self.log('Surveillance Codex classique démarrée')
 
         def pause(self,*_):
             if self.controls.pause():self.log('Pause du superviseur')
@@ -605,7 +656,9 @@ def launch():
             self.refresh()
 
         def approve(self,*_):
-            if self.engine.pending_approval:
+            if self.runner.approve():
+                self.refresh()
+            elif self.engine.pending_approval:
                 self.engine.approve()
                 self.log('Approbation locale demandée')
 
@@ -619,7 +672,17 @@ def launch():
                 self.status_box.remove_css_class('found')
                 self.target_label.set_text('○ Fenêtre non encore vérifiée / OCR expiré')
             upcoming=next_action(self.engine,self.controls.phase)
+            if self.runner.phase in ('running','paused','approval') and self.runner.current:
+                upcoming='Scénario · '+self.runner.current.label
             self.next_label.set_text('Prochaine : '+upcoming)
+            if self.runner_label is not None:
+                node=self.runner.current
+                self.runner_label.set_text('Timeline : '+self.runner.phase+
+                    (' · '+node.label+' ['+str(self.runner.index+1)+'/'+str(len(self.runner.path))+']' if node else ''))
+            displayed=self.runner.current.id if self.runner.current and self.runner.phase in ('running','paused','approval') else None
+            if self._displayed_step!=displayed:
+                self._displayed_step=displayed
+                if self.timeline_reload:self.timeline_reload()
             self.next_label.set_tooltip_text(upcoming)
             if 'force_test' in self.buttons:
                 self.buttons['force_test'].set_sensitive(
@@ -629,12 +692,14 @@ def launch():
                               'stop':self.controls.phase!='stopped',
                               'previous':self.controls.history.can_previous,
                               'next':self.controls.history.can_next,
-                              'approve':self.engine.pending_approval}.items():
+                              'approve':self.engine.pending_approval or self.runner.phase=='approval'}.items():
                 if key in self.buttons:self.buttons[key].set_sensitive(allow)
 
         def _poll(self):
             try:
-                if self.controls.phase=='running':
+                if self.runner.phase=='running':
+                    self.runner.tick()
+                elif self.controls.phase=='running':
                     self.engine.tick()
                     if not self.engine.enabled:self.controls.phase='stopped'
             except Exception as exc:self.log('Surveillance : '+str(exc))

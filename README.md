@@ -210,3 +210,47 @@ scheduler does not send anything; it resumes its normal behavior after the
 response is observed completed. Since the scheduled job is *not consumed*,
 that job may still run later at its configured time. A forced test is not a
 visual workflow runner.
+
+## Guarded workflow execution — patch 0007
+
+The **bottom timeline** now has a separate **▶ Scénario / ⏸ Scénario / ■ Scénario** transport.
+The original top **Play** continues to control the legacy Codex monitor. Only one
+controller may run at once. **Force test** is still isolated and cannot execute while
+a scenario is armed. Previous / Next still only browse history and never execute.
+
+For an executable scenario, connect **one linear chain**, beginning with a clock,
+delay or event trigger, then optional conditions and actions. A send MUST be
+**immediately preceded by an OCR or Codex-state condition**. The workflow
+runner requires two consecutive positive readings before advancing a condition,
+checks the configured target project and composer again through Scheduler on
+send, and invalidates proofs older than 12 seconds. An example is
+`Événement (cycle_finished) → Preuve OCR → Envoyer prompt`. The event only
+triggers when the runner has **observed RUNNING after arming**, followed by two
+matching FINISHED observations. An existing old “Edited files” card cannot by
+itself launch a new sequence. OCR tests use the ROI expressed in percentages
+of the **live IDE window**; narrow ROI to the actual evidence on screen before
+arming. A reference image must be imported privately first.
+
+A prompt is attempted only once per send step. If delivery cannot be confirmed,
+the scenario pauses without automatic retry, to avoid double submissions. After
+a successful prompt, the next step is gated on a **new** two-times-verified
+completion marker (and at least 25 seconds after dispatch). Quota and error
+states pause the scenario and require manual resumption. The active clip is
+highlighted in the timeline; its execution state is shown beside the controls.
+The execution graph is snapshotted at Play, so edits to blocks do not silently
+change an armed run. No screenshot, prompt, OCR result, or run trace is
+automatically uploaded to GitHub.
+
+**Limits of this first executor:** branching/parallel paths and loops are
+rejected, execution progress is in memory and is never resumed after application
+restart, and IMAP approval / automatic quota reset scheduling are not yet
+implemented. The existing single-date scheduler remains separate. Use the
+local approval mode for confirmed sends when you do not want unattended input.
+The live GTK/X11 interaction still requires testing on your Debian desktop.
+
+Launch and check with:
+
+```bash
+./.venv/bin/python -m unittest discover -s tests -v
+./start.sh
+```

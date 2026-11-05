@@ -130,7 +130,7 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12):
     return area
 
 
-def timeline_widget(Gtk, graph, proof_store, on_select):
+def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None):
     """Resizable bottom timeline: each ordered node is a time-track clip.
 
     Proof images only load from the user's private, local store.
@@ -160,6 +160,8 @@ def timeline_widget(Gtk, graph, proof_store, on_select):
             child=next_child
         for index,node in enumerate(graph.ordered()):
             frame=Gtk.Frame()
+            if active_id is not None and active_id()==node.id:
+                frame.add_css_class('scheduler-clip-active')
             frame.set_size_request(178,125)
             content=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=5)
             for margin in ('start','end','top','bottom'):

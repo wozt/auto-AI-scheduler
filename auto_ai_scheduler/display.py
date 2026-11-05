@@ -24,4 +24,5 @@ def css(font_size):
             '.scheduler-status.found {color:#57c88d;background:alpha(#208a50,.14);}'
             '.scheduler-panel {padding:6px;} '
             '.scheduler-timeline {background:alpha(@window_fg_color,.027);}'
+            '.scheduler-clip-active {outline:2px solid #50c983;outline-offset:-2px;}'
             '.scheduler-root button {min-height:26px;}').encode('utf-8')
