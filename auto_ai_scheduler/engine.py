@@ -23,6 +23,14 @@ class Session:
     quota_seen: bool = False
 
 
+@dataclass(frozen=True)
+class TargetInfo:
+    window_id: str
+    title: str
+    ui_state: str
+    seen_at: float
+
+
 class Scheduler:
     def __init__(self, config, log):
         self.config = config
@@ -33,6 +41,8 @@ class Scheduler:
         self.claims = schedule.ClaimStore()
         self._last_poll = 0.0
         self._last_idle_warning = 0.0
+        self.last_target = None
+        self.last_ui_state = 'UNKNOWN'
 
     def _notify(self, subject, body):
         c = self.config
@@ -63,6 +73,9 @@ class Scheduler:
         `action(wid, observation, offset)` executes inside the temporary-focus
         context, before focus and pointer are restored automatically.
         """
+        # Only a freshly verified Explorer+Codex window can appear as found.
+        self.last_target = None
+        self.last_ui_state = 'UNKNOWN'
         candidates = self._candidates()
         if not candidates:
             self.log('Devin absent: no action')
@@ -74,6 +87,8 @@ class Scheduler:
                     obs = vision.inspect(image, self.config['project'])
                     if not (obs.project_found and obs.codex_found):
                         continue
+                    self.last_target = TargetInfo(str(wid), title, obs.state, time.monotonic())
+                    self.last_ui_state = obs.state
                     if action:
                         action(wid, obs, offset)
                     return obs
@@ -202,7 +217,9 @@ class Scheduler:
         if self.config['mode'] == 'approval' or self.pending_approval:
             self.pending_approval = True
             return
-        if self.config['mode'] == 'auto':
+        # Never send merely because an OLD Edited-files card is visible.
+        # A locally initiated cycle must exist before auto-continuation.
+        if self.config['mode'] == 'auto' and self.session.cycles > 0:
             self.send('auto')
 
     def approve(self):

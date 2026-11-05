@@ -66,10 +66,75 @@ An already-sent job is automatically switched off in settings.
 
 ## Privacy
 
-Never commit screenshots, captured Codex conversations, exported OCR data,
+Never commit non-approved screenshots, captured Codex conversations, exported OCR data,
 mail credentials, or runtime settings. `references/`, `screenshots/` and
-`captures/` are gitignored. Tests use **synthetic OCR rows**, not private
-screenshots. No screenshot is stored or emailed by default.
+`captures/` are gitignored. Tests use synthetic OCR rows and the four explicitly approved, cropped UI fixtures. No screenshot is stored or emailed by default.
 The local claim file at `~/.local/state/auto-ai-scheduler/claims.json`
 contains only hashed opaque job identifiers (mode `0600`), not prompts.
 
+
+## Compact dashboard and approved OCR references (patch 0003)
+
+The GTK4 window now uses **two columns**, showing all current settings without
+nested settings pages:
+
+- **Left:** IDE/project/prompt and completion mode, one-shot schedule, activity log.
+- **Right:** OCR/scroll/cycle/idle controls and all SMTP fields (including SSL
+  port and the prompt/error notification toggles).
+- **Bottom:** Save, detect, send, start, stop and approve, with a short status.
+
+The default window size is **1160 × 700**. Its settings are kept in the
+existing `~/.config/auto-ai-scheduler/settings.json`; this patch does **not**
+change or reset existing schedules, prompts, or mail settings. A minimum window
+size is set to preserve the side-by-side layout.
+
+### Privacy and screenshots
+
+Only these **four user-approved cropped UI snippets** have been added under
+`tests/fixtures/codex_ui/`:
+
+- `explorer_project.png` — Explorer title and project label.
+- `edited_files.png` — edited-file summary card.
+- `quota_banner.png` — usage-limit and reset time banner.
+- `cycle_quota.png` — summary, quota, and empty composer together.
+
+These files are used by OCR regression tests; **no other desktop captures are
+committed by the patch**. The existing `references/`, `screenshots/`, and
+`captures/` directories stay ignored. Never add real sessions, credentials,
+account data or screenshots containing confidential information. The old
+non-approved screenshots remain excluded and are not restored.
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m auto_ai_scheduler
+```
+
+This GUI change does not implement IMAP email approval or automatic quota reset
+resume; both still require separate work. Live GTK layout should be verified on
+your X11 desktop because CI/headless environments cannot render Devin.
+
+## Compact single-page controller (patch 0004)
+
+The UI has a **single GTK4 window with two columns**: X11 target, one-shot
+schedule and read-only event history on the left; OCR monitoring and SMTP
+settings on the right. A status strip turns green **only after recent OCR
+verification of the exact project window** and also shows the upcoming action.
+A stale observation reverts to neutral; window titles alone cannot certify a
+project. The status is refreshed without taking focus or moving the pointer.
+
+- **Play:** start/resume monitoring; keeps the existing send/cycle state.
+- **Pause:** suspend all scheduled and automatic interactions, without losing
+  in-memory state. Manual Send remains a deliberate, separate action.
+- **Stop:** turn monitoring off; saved settings and one-shot schedule remain.
+- **Previous / Next (preview):** browse the recent in-memory action log and
+  the predicted upcoming action. **These buttons do not type, send, undo,
+  or invoke the IDE.**
+- **Send now / Approve:** retain the verified-project and quota safeguards.
+
+Automatic continuation now requires at least one successful prompt sent by
+this supervisor: an old `Edited N files` card by itself can no longer start a
+new automatic chain when the application is launched. The GUI is deliberately
+compact (12px content, 13px headings) and does not open extra settings pages.
+It remains an X11 prototype; real GTK rendering and focus behavior still
+require interactive testing on Debian/KDE. No private screens or OCR logs
+are committed by this patch.
