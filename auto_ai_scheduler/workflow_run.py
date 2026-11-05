@@ -6,8 +6,10 @@ No automated execution resumes on application launch or after a crash.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 import copy
+import hashlib
+import re
 import time
 
 from . import schedule, x11
@@ -19,6 +21,7 @@ CONDITIONS = {'ocr', 'state'}
 ACTIONS = {'send', 'scroll', 'notify', 'wait'}
 EVENTS = {'cycle_finished', 'quota', 'error', 'ready'}
 STATES = {'READY', 'RUNNING', 'FINISHED', 'QUOTA', 'ERROR'}
+WAITABLE = {'event', 'state', 'ocr', 'branch', 'quota_wait'}
 
 
 def _number(value, minimum, maximum, name):
@@ -103,6 +106,144 @@ def execution_path(graph: Workflow, proofs):
     return path
 
 
+def parse_quota_reset(text):
+    """Read an explicit English Codex local-time deadline; never guess one.
+
+    e.g. "Your rate limit resets on Nov 6, 2026, 12:28 AM".
+    A missing year, time, AM/PM, or malformed date fails closed.
+    """
+    if not isinstance(text, str):
+        return None
+    match = re.search(
+        r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+'
+        r'(\d{1,2}),?\s+(20\d{2}),?\s+(\d{1,2}):(\d{2})\s*(AM|PM)\b',
+        text, re.I)
+    if not match:
+        return None
+    month, day, year, hour, minute, meridian = match.groups()
+    months = dict(zip(('jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'),range(1,13)))
+    h, minute = int(hour), int(minute)
+    if not (1 <= h <= 12 and 0 <= minute < 60):
+        return None
+    h = h % 12 + (12 if meridian.upper() == 'PM' else 0)
+    try:
+        # Do not use strptime(%b): French LC_TIME would reject English "Nov".
+        return datetime(int(year), months[month.lower()[:3]], int(day), h, minute)
+    except ValueError:
+        return None
+
+
+def execution_plan(graph: Workflow, proofs):
+    """Compile a single active path through an acyclic graph with optional YES/NO.
+
+    There is no concurrency or implicit repetition. A join is permitted because
+    only one route is active at a time; a second branch cannot replay a send.
+    """
+    if not any(n.kind in ('branch', 'quota_wait') for n in graph.nodes):
+        path = execution_path(graph, proofs)
+        return path, {node.id: {'next': path[i+1].id if i+1 < len(path) else None}
+                      for i, node in enumerate(path)}
+    if not graph.nodes or len(graph.nodes) > 50 or graph.has_cycle():
+        raise ValueError('Scénario vide, trop long ou cyclique')
+    nodes = {n.id: n for n in graph.nodes}
+    if len(nodes) != len(graph.nodes):
+        raise ValueError('Identifiants de blocs dupliqués')
+    outgoing = {ident: {} for ident in nodes}
+    parents = {ident: [] for ident in nodes}
+    for edge in graph.edges:
+        if not isinstance(edge, (list, tuple)) or len(edge) not in (2, 3):
+            raise ValueError('Connexion invalide')
+        src, dst = edge[:2]
+        if src not in nodes or dst not in nodes or src == dst:
+            raise ValueError('Connexion vers un bloc introuvable')
+        slot = edge[2] if len(edge) == 3 else 'next'
+        if nodes[src].kind == 'branch':
+            if slot not in ('yes', 'no'):
+                raise ValueError('Chaque sortie du branchement doit être yes ou no')
+        elif slot != 'next':
+            raise ValueError('Sortie conditionnelle sur un bloc non conditionnel')
+        if slot in outgoing[src]:
+            raise ValueError('Une sortie ne peut alimenter deux blocs')
+        outgoing[src][slot] = dst
+        parents[dst].append((src, slot))
+    roots = [ident for ident in nodes if not parents[ident]]
+    if len(roots) != 1 or nodes[roots[0]].kind not in TRIGGERS:
+        raise ValueError('Le scénario doit avoir un seul bloc déclencheur au départ')
+    discovered = set()
+    pending = [roots[0]]
+    while pending:
+        ident = pending.pop()
+        if ident in discovered:
+            continue
+        discovered.add(ident)
+        pending.extend(outgoing[ident].values())
+    if len(discovered) != len(nodes):
+        raise ValueError('Tous les blocs doivent être reliés au départ')
+    for node in graph.nodes:
+        p = node.params
+        kind = node.kind
+        slots = outgoing[node.id]
+        if kind == 'branch':
+            if set(slots) != {'yes', 'no'}:
+                raise ValueError('Le bloc Si / Sinon exige deux sorties OUI et NON')
+            if p.get('source') not in ('state', 'ocr'):
+                raise ValueError('Branchement : source doit être state ou ocr')
+            if p['source'] == 'state':
+                if p.get('state') not in STATES:
+                    raise ValueError('Branchement : état Codex non reconnu')
+            else:
+                if not p.get('expected','').strip() or len(p['expected']) > 240:
+                    raise ValueError('Branchement OCR : texte attendu requis')
+                parse_roi(p.get('roi',''))
+                if not proofs._file(p.get('proof_id','')).is_file():
+                    raise ValueError('Branchement OCR : capture locale introuvable')
+        elif len(slots) > 1:
+            raise ValueError('Seul le bloc Si / Sinon peut avoir deux sorties')
+        if kind == 'clock':
+            if parents[node.id]:
+                raise ValueError('Horloge uniquement en début de chaîne')
+            schedule.parse_local(p.get('at',''))
+        elif kind == 'event':
+            if parents[node.id] or p.get('event') not in EVENTS:
+                raise ValueError('Événement invalide ou placé après le départ')
+        elif kind in ('delay', 'wait'):
+            _number(p.get('seconds'), 1, 86400, kind)
+        elif kind == 'state':
+            if p.get('state') not in STATES:
+                raise ValueError('État Codex inconnu')
+        elif kind == 'ocr':
+            if not p.get('expected','').strip() or len(p['expected']) > 240:
+                raise ValueError('Preuve OCR manquante')
+            parse_roi(p.get('roi',''))
+            if not proofs._file(p.get('proof_id','')).is_file():
+                raise ValueError('Image de preuve OCR locale introuvable')
+        elif kind == 'send':
+            prompt = p.get('prompt','')
+            if not prompt.strip() or '\n' in prompt or len(prompt) > 4000:
+                raise ValueError('Prompt manquant ou invalide')
+            if not parents[node.id] or any(
+                nodes[src].kind not in ('state','ocr','branch') or
+                (nodes[src].kind == 'branch' and (slot != 'yes' or
+                 (nodes[src].params.get('source') == 'state' and
+                  nodes[src].params.get('state') in ('QUOTA','ERROR'))))
+                for src, slot in parents[node.id]
+            ):
+                raise ValueError('Chaque entrée d’un envoi doit être une preuve OCR/État ou Si/OUI')
+        elif kind == 'scroll':
+            _number(p.get('steps'),1,80,'scroll')
+        elif kind == 'notify':
+            if not (1 <= len(p.get('subject','')) <= 200):
+                raise ValueError('Sujet de rapport invalide')
+        elif kind == 'quota_wait':
+            if p.get('resume','manual') not in ('manual', 'auto'):
+                raise ValueError('Reprise quota : manual ou auto uniquement')
+        elif kind != 'branch':
+            raise ValueError('Bloc non pris en charge : ' + kind)
+        if kind in WAITABLE:
+            _number(p.get('timeout_seconds','0'),0,86400,'timeout_seconds')
+    return graph.ordered(), outgoing
+
+
 class WorkflowRunner:
     """Explicitly armed runner; one transition or action per tick.
 
@@ -130,6 +271,11 @@ class WorkflowRunner:
         self.last_reason = ''
         self.send_attempted = False
         self.evidence_at = None
+        self.links = {}
+        self.positions = {}
+        self.quota_seen = False
+        self.quota_deadline = None
+        self.quota_confirmation = 0
 
     @property
     def current(self):
@@ -142,8 +288,10 @@ class WorkflowRunner:
             raise ValueError('Arrêtez la surveillance ou attendez la réponse Codex avant de démarrer')
         # Snapshot to prevent GUI edits from changing an armed automation.
         frozen = Workflow.from_dict(copy.deepcopy(graph.to_dict()))
-        path = execution_path(frozen, self.proofs)
+        path, links = execution_plan(frozen, self.proofs)
         self.path = path
+        self.links = links
+        self.positions = {node.id: i for i, node in enumerate(path)}
         self.index = 0
         self.entered_at = self.monotonic()
         self.stable = 0
@@ -154,6 +302,9 @@ class WorkflowRunner:
         self.last_reason = ''
         self.send_attempted = False
         self.evidence_at = None
+        self.quota_seen = False
+        self.quota_deadline = None
+        self.quota_confirmation = 0
         self.phase = 'running'
         self.log(f'Scénario armé : {len(path)} blocs · aucune action sans vérification')
 
@@ -190,9 +341,10 @@ class WorkflowRunner:
         self.log('Prochain envoi du scénario approuvé localement')
         return True
 
-    def _advance(self):
+    def _advance(self, route='next'):
         old = self.current
-        self.index += 1
+        destination = self.links.get(old.id, {}).get(route)
+        self.index = self.positions[destination] if destination is not None else len(self.path)
         self.entered_at = self.monotonic()
         self.stable = 0
         self.last_match = None
@@ -242,6 +394,86 @@ class WorkflowRunner:
         elif obs.state != 'FINISHED' or not marker or marker == self.sent_marker:
             self._confirmed(None)
 
+    def _branch_tick(self, node, now):
+        p = node.params
+        obs, image = self._observe(require_image=p.get('source') == 'ocr')
+        if obs is None:
+            self._confirmed(None)
+            return
+        # An unexpected quota, error or still-busy response is NOT a reliable
+        # negative result. Stay in place instead of entering the wrong branch.
+        if obs.state in ('QUOTA','ERROR') and (
+                p.get('source') != 'state' or obs.state != p.get('state')):
+            self._confirmed(None)
+            return
+        if obs.state == 'RUNNING' and p.get('state') != 'RUNNING':
+            self._confirmed(None)
+            return
+        if p['source'] == 'state':
+            direction = 'yes' if obs.state == p['state'] else 'no'
+            if obs.state not in ('READY', 'RUNNING', 'FINISHED', 'QUOTA', 'ERROR'):
+                self._confirmed(None)
+                return
+            marker = 'state:' + obs.state
+        else:
+            if image is None or obs.state not in ('READY','FINISHED'):
+                self._confirmed(None)
+                return
+            try:
+                actual = ocr_image(image, p['roi'])
+                if not actual.strip():
+                    self._confirmed(None)
+                    return
+                direction = 'yes' if match_text(actual,p['expected']) else 'no'
+                marker = hashlib.sha256(actual.casefold().encode()).hexdigest()[:16]
+            except Exception:
+                self._confirmed(None)
+                return
+        if self._confirmed('branch:' + direction + ':' + marker):
+            # Negative proof cannot authorize a direct send. Positive evidence
+            # still needs a fresh verification at the destination Send block.
+            self.evidence_at = now if direction == 'yes' else None
+            self.log('Condition ' + node.label + ' → ' + ('OUI' if direction == 'yes' else 'NON'))
+            self._advance(route=direction)
+
+    def _quota_tick(self, node, now):
+        obs, _ = self._observe()
+        if obs is None:
+            self._confirmed(None)
+            return
+        wall_now = self.wall_clock()
+        if obs.state == 'QUOTA':
+            deadline = parse_quota_reset(obs.reset_text)
+            # A deadline in the past suggests stale/misread OCR. No guessing.
+            if deadline is None or deadline + timedelta(minutes=5) < wall_now:
+                self.pause('Quota : heure OCR absente ou incohérente ; vérification manuelle')
+                return
+            if self._confirmed('quota-reset:' + deadline.isoformat()):
+                if not self.quota_seen:
+                    self.log('Limite détectée · reprise pas avant ' + deadline.strftime('%Y-%m-%d %H:%M'))
+                self.quota_seen = True
+                self.quota_deadline = deadline
+            return
+        if not self.quota_seen or self.quota_deadline is None:
+            # A stale READY card does not prove there was ever a quota.
+            self._confirmed(None)
+            return
+        if wall_now < self.quota_deadline:
+            self._confirmed(None)
+            return
+        if obs.state not in ('READY','FINISHED') or obs.composer is None:
+            self._confirmed(None)
+            return
+        if self._confirmed('quota-cleared:' + obs.state):
+            if node.params.get('resume','manual') == 'manual' and not self.approved:
+                self.phase = 'approval'
+                self.log('Quota écoulé et disparu · approbation locale requise')
+                return
+            self.log('Quota disparu et heure dépassée · suite du scénario autorisée')
+            self.quota_seen = False
+            self.quota_deadline = None
+            self._advance()
+
     def tick(self):
         if self.phase != 'running':
             return
@@ -262,7 +494,18 @@ class WorkflowRunner:
             return
         p = node.params
         kind = node.kind
-        if kind == 'clock':
+        if kind in WAITABLE:
+            timeout = _number(p.get('timeout_seconds','0'),0,86400,'timeout_seconds')
+            if timeout and now - self.entered_at >= timeout:
+                self.pause(f'Timeout du bloc {node.label} après {timeout}s · aucune action exécutée')
+                if self.engine.config.get('email_on_error'):
+                    self.engine._notify('Scénario en timeout',f'Bloc : {node.label} · scénario suspendu')
+                return
+        if kind == 'branch':
+            self._branch_tick(node, now)
+        elif kind == 'quota_wait':
+            self._quota_tick(node, now)
+        elif kind == 'clock':
             if self.wall_clock() >= schedule.parse_local(p['at']):
                 self._advance()
         elif kind in ('delay', 'wait'):

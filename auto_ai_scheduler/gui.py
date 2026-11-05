@@ -360,17 +360,39 @@ def launch():
             desc=Gtk.Label(label=NODE_KINDS[node.kind][3],wrap=True,xalign=0)
             desc.set_tooltip_text(NODE_KINDS[node.kind][3])
             panel.append(desc)
+            if node.kind == 'branch':
+                help_label=Gtk.Label(label='Port supérieur = OUI  •  port inférieur = NON\nsource : state ou ocr ; timeout_seconds = 0 pour illimité.', xalign=0, wrap=True)
+                help_label.set_tooltip_text('Reliez deux destinations distinctes. En mode OCR, importez une preuve locale et indiquez expected/roi ; aucune absence de preuve ne déclenche un envoi.')
+                panel.append(help_label)
+            elif node.kind == 'quota_wait':
+                help_label=Gtk.Label(label='Reprise : manual (approbation) ou auto (explicite).\nLa date est lue dans le bandeau Codex ; deux vérifications sont exigées.', xalign=0, wrap=True)
+                help_label.set_tooltip_text('Pas de contournement du quota. Si la date est illisible, le scénario se suspend. Sans nouvelle confirmation de l’état Codex, aucun prompt n’est envoyé.')
+                panel.append(help_label)
             for key,value in node.params.items():
                 row=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=2)
                 title=Gtk.Label(label=key,xalign=0)
                 title.set_tooltip_text('Paramètre du bloc ; sauvegardé localement, jamais envoyé automatiquement.')
                 row.append(title)
-                entry=Gtk.Entry(text=value)
-                entry.set_tooltip_text('Entrée texte. Pour une preuve OCR, utilisez expected et roi (x,y,w,h en %).')
-                entry.connect('changed',lambda widget,k=key,n=node:self.param_changed(n,k,widget.get_text()))
-                row.append(entry)
+                options = {
+                    ('branch','source'): [('state','État Codex'),('ocr','Preuve OCR')],
+                    ('branch','state'): [(x,x) for x in ('READY','RUNNING','FINISHED','QUOTA','ERROR')],
+                    ('quota_wait','resume'): [('manual','Après approbation'),('auto','Automatique (opt-in)')],
+                }.get((node.kind,key))
+                if options:
+                    widget=Gtk.DropDown.new_from_strings([label for _,label in options])
+                    values=[ident for ident,_ in options]
+                    widget.set_selected(values.index(value) if value in values else 0)
+                    widget.connect('notify::selected',
+                                   lambda dropdown,_pspec,k=key,n=node,vals=values:
+                                   self.param_changed(n,k,vals[dropdown.get_selected()]))
+                    widget.set_tooltip_text('Choisissez une valeur autorisée pour le bloc. La reprise automatique après quota doit être activée volontairement.')
+                else:
+                    widget=Gtk.Entry(text=value)
+                    widget.set_tooltip_text('Paramètre du bloc. ROI en % : x,y,largeur,hauteur. timeout_seconds=0 désactive la limite de durée.')
+                    widget.connect('changed',lambda entry,k=key,n=node:self.param_changed(n,k,entry.get_text()))
+                row.append(widget)
                 panel.append(row)
-            if node.kind=='ocr':
+            if node.kind in ('ocr','branch'):
                 self._ocr_editor(panel,node)
             remove=Gtk.Button(label='Supprimer ce bloc')
             remove.set_tooltip_text('Supprime le bloc et ses connexions de ce scénario local.')

@@ -25,6 +25,8 @@ NODE_KINDS = {
     'scroll': ('Défiler', 'Action', {'steps': '12'}, 'Défiler jusqu’au bas du chat'),
     'notify': ('Rapport mail', 'Action', {'subject': 'Rapport de cycle'}, 'Avertissement par courriel'),
     'wait': ('Attendre', 'Action', {'seconds': '60'}, 'Suspendre la suite du scénario'),
+    'branch': ('Si / Sinon', 'Condition', {'source': 'state', 'state': 'FINISHED', 'proof_id': '', 'expected': '', 'roi': '0,0,100,100', 'timeout_seconds': '0'}, 'Deux sorties OUI (port haut) / NON (port bas), basées sur un état Codex ou une preuve OCR'),
+    'quota_wait': ('Attendre quota', 'Condition', {'resume': 'manual', 'timeout_seconds': '0'}, 'Attend une limite OCR lisible, son échéance, puis deux contrôles sans quota. Reprise manuelle par défaut.'),
 }
 
 
@@ -59,14 +61,25 @@ class Workflow:
 
     def delete(self, ident):
         self.nodes = [n for n in self.nodes if n.id != ident]
-        self.edges = [(a,b) for a,b in self.edges if a != ident and b != ident]
+        self.edges = [edge for edge in self.edges if ident not in edge[:2]]
 
-    def connect(self, a, b):
+    def connect(self, a, b, branch=None):
         if a == b or not self.find(a) or not self.find(b):
             raise ValueError('Two distinct existing nodes are required')
-        if (a,b) in self.edges:
+        source = self.find(a)
+        if source.kind == 'branch':
+            if branch not in ('yes', 'no'):
+                raise ValueError('Un branchement nécessite la sortie yes ou no')
+            if any(e[0] == a and len(e) == 3 and e[2] == branch for e in self.edges):
+                raise ValueError('Cette sortie du branchement est déjà reliée')
+            edge = (a, b, branch)
+        else:
+            if branch is not None:
+                raise ValueError('Seul le bloc Si / Sinon possède deux sorties')
+            edge = (a, b)
+        if edge in self.edges:
             return
-        self.edges.append((a,b))
+        self.edges.append(edge)
         if self.has_cycle():
             self.edges.pop()
             raise ValueError('Connections cannot create an infinite loop')
@@ -74,7 +87,8 @@ class Workflow:
     def has_cycle(self):
         incoming = {n.id: 0 for n in self.nodes}
         graph = {n.id: [] for n in self.nodes}
-        for a,b in self.edges:
+        for edge in self.edges:
+            a, b = edge[:2]
             if a not in graph or b not in graph:
                 return True
             graph[a].append(b)
@@ -94,7 +108,8 @@ class Workflow:
         """Stable topological order used in the read-only timeline."""
         incoming = {n.id: 0 for n in self.nodes}
         adj = {n.id: [] for n in self.nodes}
-        for a,b in self.edges:
+        for edge in self.edges:
+            a, b = edge[:2]
             incoming[b] += 1
             adj[a].append(b)
         # Nodes with no dependency are ordered by their position in the
@@ -136,7 +151,16 @@ class Workflow:
             if not isinstance(params,dict) or any(not isinstance(k,str) or not isinstance(v,str) for k,v in params.items()):
                 raise ValueError('Invalid node parameters')
             nodes.append(Node(item['id'], item['kind'],int(item['x']),int(item['y']),params))
-        graph=cls(nodes, data.get('edges', []), str(data.get('name','Scénario')))
+        edges = data.get('edges', [])
+        if not isinstance(edges, list):
+            raise ValueError('Invalid scenario connections')
+        for edge in edges:
+            if (not isinstance(edge, (list, tuple)) or len(edge) not in (2, 3)
+                    or any(not isinstance(v, str) for v in edge)):
+                raise ValueError('Invalid scenario edge')
+            if len(edge) == 3 and edge[2] not in ('yes', 'no'):
+                raise ValueError('Invalid conditional exit')
+        graph=cls(nodes, edges, str(data.get('name','Scénario')))
         if graph.has_cycle():
             raise ValueError('Invalid scenario connections')
         return graph

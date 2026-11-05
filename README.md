@@ -254,3 +254,44 @@ Launch and check with:
 ./.venv/bin/python -m unittest discover -s tests -v
 ./start.sh
 ```
+
+## Conditional branching and quota-aware waiting (patch 0008)
+
+The bottom timeline still displays the graph; **Scenario Play** is the only
+way to arm it. The classic monitor cannot run in parallel. The new **Si / Sinon**
+node has **two output ports** on the right: upper green **OUI** and lower orange
+**NON**. Connect each port to a destination, and set `source` to `state` (read
+Codex READY/RUNNING/FINISHED/QUOTA/ERROR) or `ocr` (reference screenshot,
+`expected` text and normalized `roi` region). Each outcome needs **two stable,
+recent observations**. Ambiguous, empty or unavailable OCR is **not** taken as
+NO; an unexpected quota, error or in-progress response also prevents a mistaken
+negative branch. Each path executes in sequence, never in parallel, and merges
+are allowed in an acyclic graph. A Send node must immediately follow a positive
+OCR/State condition or a positive safe branch; **NON -> Send is refused**.
+
+The **Attendre quota** node is designed for an explicit chain such as:
+
+    Événement (quota) -> Attendre quota -> État Codex (READY) -> Envoyer prompt
+
+It reads an **English date with year and 12-hour time** from the Codex banner,
+for example `Nov 6, 2026, 12:28 AM`, interpreted as the machine's local time.
+The app **does not alter Codex quotas**. It waits until that time, checks the
+quota banner has disappeared and the verified composer is READY/FINISHED on
+**two consistent inspections**, then requires **local approval by default**.
+`resume=auto` is an explicit opt-in and still requires the time plus the two
+fresh UI checks. Missing/unreadable/past reset time causes a safety pause.
+Timezone labels embedded in free-form OCR are not interpreted: verify that
+Codex and Debian present local time consistently. During DST transitions, the
+user should prefer the default manual approval mode. An interrupted response
+is never silently re-sent after quota recovery; check it before restarting.
+
+For Event, OCR, State, Si / Sinon and Attendre quota blocks,
+`timeout_seconds` is optional (0 = no timeout, 1..86400 = bounded). A timeout
+pauses the scenario and optionally sends the already configured SMTP error
+notification. It never moves to the next action or sends a prompt. The current
+execution state remains in RAM; after a restart, **Scenario Play** must be
+activated manually and the graph starts anew. Do not use automatic resume for
+critical edits without interactive verification on Devin/KDE.
+
+No screenshot or OCR transcript is committed, stored or emailed by this patch.
+The new tests use only synthetic OCR observations and throwaway local images.

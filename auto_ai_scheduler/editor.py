@@ -24,7 +24,7 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12):
     area.set_content_height(1050)
     area.set_hexpand(True)
     area.set_vexpand(True)
-    pending={'from':None}
+    pending={'from':None, 'branch':None}
     drag={'node':None,'x':0,'y':0}
 
     def draw(area, cr, width, height):
@@ -35,16 +35,23 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12):
             for y in range(0,height,30):
                 cr.arc(x,y,1.0,0,math.tau)
                 cr.fill()
-        for a,b in graph.edges:
+        for edge in graph.edges:
+            a,b=edge[:2]
+            branch=edge[2] if len(edge)==3 else None
             x,y=graph.find(a),graph.find(b)
             if x is None or y is None:continue
-            sx,sy=x.x+NODE_W,x.y+NODE_H/2
+            sx,sy=x.x+NODE_W,x.y+(NODE_H/3 if branch=='yes' else 2*NODE_H/3 if branch=='no' else NODE_H/2)
             ex,ey=y.x,y.y+NODE_H/2
             cr.set_source_rgba(.54,.76,.93,.9)
             cr.set_line_width(3)
             cr.move_to(sx,sy)
             cr.curve_to(sx+75,sy,ex-75,ey,ex,ey)
             cr.stroke()
+            if branch:
+                cr.set_source_rgb(.7,.9,.7) if branch=='yes' else cr.set_source_rgb(.96,.69,.43)
+                cr.set_font_size(max(10,font-2))
+                cr.move_to(sx+9,sy-5)
+                cr.show_text('OUI' if branch=='yes' else 'NON')
         for n in graph.nodes:
             r,g,b=PALETTE[NODE_KINDS[n.kind][1]]
             cr.set_source_rgba(.13,.17,.21,1)
@@ -70,12 +77,21 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12):
             cr.set_source_rgb(.78,.81,.84)
             cr.arc(n.x,n.y+NODE_H/2,5,0,math.tau)
             cr.fill()
-            cr.set_source_rgb(.43,.84,.58)
-            cr.arc(n.x+NODE_W,n.y+NODE_H/2,6,0,math.tau)
-            cr.fill()
+            if n.kind=='branch':
+                for label,dy,color in [('OUI',NODE_H/3,(.43,.84,.58)),('NON',NODE_H*2/3,(.94,.59,.31))]:
+                    cr.set_source_rgb(*color)
+                    cr.arc(n.x+NODE_W,n.y+dy,6,0,math.tau)
+                    cr.fill()
+                    cr.set_font_size(max(9,font-3))
+                    cr.move_to(n.x+NODE_W-35,n.y+dy+4)
+                    cr.show_text(label)
+            else:
+                cr.set_source_rgb(.43,.84,.58)
+                cr.arc(n.x+NODE_W,n.y+NODE_H/2,6,0,math.tau)
+                cr.fill()
             if pending['from']==n.id:
                 cr.set_source_rgb(1,.93,.4)
-                cr.arc(n.x+NODE_W,n.y+NODE_H/2,10,0,math.tau)
+                cr.arc(n.x+NODE_W,n.y+(NODE_H/3 if pending.get('branch')=='yes' else 2*NODE_H/3 if pending.get('branch')=='no' else NODE_H/2),10,0,math.tau)
                 cr.stroke()
     area.set_draw_func(draw)
 
@@ -83,19 +99,22 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12):
         n=hit_node(graph,x,y)
         if n and x>=n.x+NODE_W-18:
             pending['from']=n.id
-            on_message('Connexion : choisissez le port gauche du bloc de destination')
+            pending['branch']=('yes' if y<n.y+NODE_H/2 else 'no') if n.kind=='branch' else None
+            on_message('Connexion : sortie ' + (pending['branch'] or 'unique') + ' → port gauche de destination')
         elif n and x<=n.x+18 and pending['from']:
             try:
-                graph.connect(pending['from'],n.id)
+                graph.connect(pending['from'],n.id,branch=pending['branch'])
                 on_changed()
                 on_message('Blocs connectés')
             except ValueError as exc:
                 on_message(str(exc))
             pending['from']=None
+            pending['branch']=None
         elif n:
             on_select(n.id)
         else:
             pending['from']=None
+            pending['branch']=None
             on_select(None)
         area.queue_draw()
 
