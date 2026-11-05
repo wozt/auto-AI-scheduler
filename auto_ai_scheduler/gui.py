@@ -11,6 +11,7 @@ from .control import RunControls, next_action, recent_target
 from .engine import Scheduler
 from .workflow import NODE_KINDS, WorkflowStore, planned_send
 from .workflow_run import WorkflowRunner
+from .workflow_checkpoint import CheckpointStore
 from .proofs import ProofStore
 from . import editor
 
@@ -70,7 +71,9 @@ def launch():
             self.workflow_store=WorkflowStore()
             self.proof_store=ProofStore()
             self.graph=self.workflow_store.load()
-            self.runner=WorkflowRunner(self.engine,self.proof_store,self.log)
+            self.checkpoint_store=CheckpointStore()
+            self.runner=WorkflowRunner(self.engine,self.proof_store,self.log,
+                                       checkpoints=self.checkpoint_store)
             self._displayed_step=None
             self.runner_label=None
             self.selected=None
@@ -294,6 +297,8 @@ def launch():
                 ('▶ Scénario',self.workflow_start,'Armer un scénario validé. N’envoie rien tant que le déclencheur et les conditions ne sont pas vérifiés.'),
                 ('⏸ Scénario',self.workflow_pause,'Suspendre la timeline et toute action de ce scénario.'),
                 ('■ Scénario',self.workflow_stop,'Arrêter le scénario, sans reprendre le superviseur classique.'),
+                ('↶ Restaurer',self.workflow_restore,'Charger la progression privée après redémarrage. Toujours en pause, sans clic sur Devin.'),
+                ('✕ Effacer reprise',self.workflow_forget,'Supprimer volontairement le checkpoint après confirmation ; attention aux envois déjà tentés.'),
             ):
                 btn=Gtk.Button(label=label)
                 btn.set_tooltip_text(help_text)
@@ -644,10 +649,52 @@ def launch():
                 else:
                     if self.controls.phase == 'running':
                         self.controls.stop()
+                    self.workflow_store.save(self.graph)
                     self.runner.start(self.graph)
                 self.refresh()
             except ValueError as exc:
                 self.log('Scénario refusé : ' + str(exc))
+
+        def workflow_restore(self,*_):
+            try:
+                if self.controls.phase == 'running':
+                    self.controls.stop()
+                # Load exact saved graph. Unsaved visual changes must never
+                # substitute a different prompt when restoring a checkpoint.
+                self.runner.restore(self.workflow_store.load())
+                self.refresh()
+            except (ValueError, OSError) as exc:
+                self.log('Restauration refusée : ' + str(exc))
+
+        def workflow_forget(self,*_):
+            try:
+                checkpoint=self.checkpoint_store.load()
+            except (ValueError, OSError) as exc:
+                self.log('Checkpoint illisible : '+str(exc))
+                return
+            if checkpoint is None:
+                self.log('Aucune reprise à effacer')
+                return
+            dialog=Adw.MessageDialog.new(self.window,'Effacer la progression ?',
+                  'Cette suppression est définitive. Un prompt a peut-être déjà été envoyé. '
+                  'Vérifiez Codex avant de redémarrer le scénario depuis le début.')
+            dialog.add_response('cancel','Annuler')
+            dialog.add_response('clear','Effacer le checkpoint')
+            dialog.set_response_appearance('clear',Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.set_default_response('cancel')
+            dialog.set_close_response('cancel')
+            def confirmed(_dialog,response):
+                if response!='clear':return
+                try:
+                    if self.runner.phase=='running':
+                        self.runner.pause()
+                    self.runner.forget_checkpoint()
+                    self.log('Progression oubliée sur demande · vérifiez Codex avant un nouveau départ')
+                    self.refresh()
+                except (ValueError,OSError) as exc:
+                    self.log('Impossible d’effacer : '+str(exc))
+            dialog.connect('response',confirmed)
+            dialog.present()
 
         def workflow_pause(self,*_):
             self.runner.pause()
@@ -660,6 +707,13 @@ def launch():
         def play(self,*_):
             if self.runner.phase in ('running','paused','approval'):
                 self.log('Arrêtez le scénario avant de lancer le superviseur classique')
+                return
+            try:
+                if self.checkpoint_store.load() is not None:
+                    self.log('Reprise de scénario en attente : restaurer ou effacer le checkpoint avant Play')
+                    return
+            except (ValueError,OSError) as exc:
+                self.log('Checkpoint illisible : '+str(exc))
                 return
             if self.controls.play():self.log('Surveillance Codex classique démarrée')
 
@@ -699,8 +753,14 @@ def launch():
             self.next_label.set_text('Prochaine : '+upcoming)
             if self.runner_label is not None:
                 node=self.runner.current
-                self.runner_label.set_text('Timeline : '+self.runner.phase+
-                    (' · '+node.label+' ['+str(self.runner.index+1)+'/'+str(len(self.runner.path))+']' if node else ''))
+                caption='Timeline : '+self.runner.phase+(' · '+node.label+' ['+str(self.runner.index+1)+'/'+str(len(self.runner.path))+']' if node else '')
+                if self.runner.phase=='stopped':
+                    try:
+                        saved=self.checkpoint_store.load()
+                        if saved:caption='⚠ Progression sauvegardée · ↶ Restaurer (aucune exécution automatique)'
+                    except (ValueError,OSError):
+                        caption='⚠ Checkpoint illisible · démarrage désactivé'
+                self.runner_label.set_text(caption)
             displayed=self.runner.current.id if self.runner.current and self.runner.phase in ('running','paused','approval') else None
             if self._displayed_step!=displayed:
                 self._displayed_step=displayed

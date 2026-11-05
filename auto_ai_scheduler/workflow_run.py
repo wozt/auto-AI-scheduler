@@ -15,6 +15,7 @@ import time
 from . import schedule, x11
 from .proofs import match_text, ocr_image, parse_roi
 from .workflow import Workflow
+from .workflow_checkpoint import CheckpointStore, graph_fingerprint
 
 TRIGGERS = {'clock', 'delay', 'event'}
 CONDITIONS = {'ocr', 'state'}
@@ -251,7 +252,7 @@ class WorkflowRunner:
     An outgoing prompt requires two consistent OCR/state observations and
     Scheduler's own fresh project/composer/idle/cooldown validations.
     """
-    def __init__(self, engine, proof_store, log, monotonic=None, wall_clock=None):
+    def __init__(self, engine, proof_store, log, monotonic=None, wall_clock=None, checkpoints=None):
         self.engine = engine
         self.proofs = proof_store
         self.log = log
@@ -276,6 +277,88 @@ class WorkflowRunner:
         self.quota_seen = False
         self.quota_deadline = None
         self.quota_confirmation = 0
+        self.checkpoints = checkpoints
+        self.workflow_digest = None
+        self.recovered = False
+
+    def _checkpoint(self):
+        if self.checkpoints is None or self.workflow_digest is None:
+            return
+        if self.phase not in ('running','paused','approval') or self.current is None:
+            return
+        send_state = ('awaiting_response' if self.waiting_response else
+                      'attempted' if self.send_attempted else 'none')
+        self.checkpoints.save(workflow=self.workflow_digest, node=self.current.id,
+                              phase=self.phase, send_state=send_state)
+
+    def restore(self, graph):
+        """Load a matching checkpoint PAUSED. Never move X11 or send on restore.
+
+        All OCR/branch/quota observations are reset; delay timers begin again
+        from Resume. A previously attempted prompt is never replayed.
+        """
+        if self.checkpoints is None:
+            raise ValueError('Stockage de progression non configuré')
+        if self.phase not in ('stopped','done','error'):
+            raise ValueError('Arrêtez le scénario courant avant de restaurer')
+        if self.engine.enabled or self.engine.session.waiting_for_response or self.engine.force_test_pending:
+            raise ValueError('Arrêtez le superviseur classique et les tests en cours')
+        saved = self.checkpoints.load()
+        if saved is None:
+            raise ValueError('Aucune reprise enregistrée')
+        frozen = Workflow.from_dict(copy.deepcopy(graph.to_dict()))
+        digest = graph_fingerprint(frozen)
+        if saved['workflow'] != digest:
+            raise ValueError('Le graphe a changé depuis le checkpoint ; reprise refusée')
+        path, links = execution_plan(frozen, self.proofs)
+        positions = {node.id:i for i,node in enumerate(path)}
+        if saved['node'] not in positions:
+            raise ValueError('Bloc sauvegardé introuvable dans le graphe')
+        index = positions[saved['node']]
+        # If the next step was a send and no typing was yet attempted, go
+        # BACK to its prerequisite condition. Never trust pre-crash proof.
+        if saved['send_state'] == 'none' and path[index].kind == 'send':
+            parents = [src for src, destinations in links.items()
+                       if saved['node'] in destinations.values()]
+            if len(parents) != 1 or path[positions[parents[0]]].kind not in ('ocr','state','branch'):
+                raise ValueError('Entrée du prompt ambiguë : reprise manuelle uniquement')
+            index = positions[parents[0]]
+        self.path = path
+        self.links = links
+        self.positions = positions
+        self.index = index
+        self.workflow_digest = digest
+        self.entered_at = self.monotonic()
+        self.stable = 0
+        self.last_match = None
+        self.saw_running = False
+        self.evidence_at = None
+        self.approved = False
+        self.quota_seen = False
+        self.quota_deadline = None
+        self.quota_confirmation = 0
+        self.send_attempted = saved['send_state'] != 'none'
+        self.waiting_response = False
+        self.sent_at = 0.0
+        self.sent_marker = ''
+        self.recovered = True
+        self.phase = 'paused'
+        self.last_reason = ('ENVOI INCERTAIN : vérifiez Codex. Stop puis réarmement explicite requis.'
+                            if self.send_attempted else
+                            'Reprise chargée en pause : cliquez sur Scénario pour reprendre et revérifier.')
+        # Preserve an older 'attempted' checkpoint as a hard block.
+        self._checkpoint()
+        self.log(f'Restauration au bloc {self.current.label} · {self.last_reason}')
+        return True
+
+    def forget_checkpoint(self):
+        """Explicitly discard a pending recovery after the user confirms."""
+        if self.phase in ('running','approval'):
+            raise ValueError('Mettez d’abord le scénario en pause ou arrêtez-le')
+        if self.phase == 'paused':
+            self.phase = 'stopped'
+        self.workflow_digest = None
+        return self.checkpoints.clear() if self.checkpoints is not None else False
 
     @property
     def current(self):
@@ -289,6 +372,11 @@ class WorkflowRunner:
         # Snapshot to prevent GUI edits from changing an armed automation.
         frozen = Workflow.from_dict(copy.deepcopy(graph.to_dict()))
         path, links = execution_plan(frozen, self.proofs)
+        digest = graph_fingerprint(frozen)
+        if self.checkpoints is not None and self.checkpoints.load() is not None:
+            raise ValueError('Checkpoint existant : utilisez Restaurer ou Effacer reprise')
+        self.workflow_digest = digest
+        self.recovered = False
         self.path = path
         self.links = links
         self.positions = {node.id: i for i, node in enumerate(path)}
@@ -306,12 +394,18 @@ class WorkflowRunner:
         self.quota_deadline = None
         self.quota_confirmation = 0
         self.phase = 'running'
+        try:
+            self._checkpoint()
+        except Exception:
+            self.phase = 'stopped'
+            raise
         self.log(f'Scénario armé : {len(path)} blocs · aucune action sans vérification')
 
     def pause(self, reason='Pause demandée'):
         if self.phase in ('running', 'approval'):
             self.phase = 'paused'
             self.last_reason = reason
+            self._checkpoint()
             self.log(reason)
             return True
         return False
@@ -319,17 +413,39 @@ class WorkflowRunner:
     def resume(self):
         if self.phase != 'paused':
             return False
+        if self.recovered and self.send_attempted:
+            raise ValueError('Envoi incertain après redémarrage : vérifiez Codex, puis Stop ou Effacer reprise')
         if self.send_attempted and not self.waiting_response:
             raise ValueError('Envoi incertain : Stop puis vérifiez Codex avant de réarmer le scénario')
         self.phase = 'approval' if (self.current is not None and self.current.kind == 'send'
                                     and self.engine.config['mode'] == 'approval' and not self.approved) else 'running'
+        # Time passed while the app was closed is NOT credited to a delay.
+        # All sensitive observations have been reset during restore.
+        if self.recovered:
+            self.entered_at = self.monotonic()
+            self.recovered = False
+        self._checkpoint()
         self.log('Scénario repris · contrôles de sécurité conservés')
         return True
 
     def stop(self):
         if self.phase == 'stopped':
             return False
+        # Stop must NEVER silently erase evidence of a possibly delivered
+        # prompt. Only the separate, confirmed Forget action can do that.
+        unsafe_send = self.send_attempted or self.waiting_response
+        if self.checkpoints is not None and unsafe_send and self.workflow_digest:
+            self.phase = 'paused'
+            self.send_attempted = True
+            self.waiting_response = False
+            self._checkpoint()
+            self.phase = 'stopped'
+            self.log('Scénario arrêté ; envoi incertain : checkpoint conservé jusqu’à effacement confirmé')
+            return True
         self.phase = 'stopped'
+        self.workflow_digest = None
+        if self.checkpoints is not None:
+            self.checkpoints.clear()
         self.log('Scénario arrêté · aucun redémarrage automatique')
         return True
 
@@ -338,6 +454,7 @@ class WorkflowRunner:
             return False
         self.approved = True
         self.phase = 'running'
+        self._checkpoint()
         self.log('Prochain envoi du scénario approuvé localement')
         return True
 
@@ -353,8 +470,11 @@ class WorkflowRunner:
         self.send_attempted = False
         if self.current is None:
             self.phase = 'done'
+            if self.checkpoints is not None:
+                self.checkpoints.clear()
             self.log('Scénario terminé · aucune reprise automatique')
         else:
+            self._checkpoint()
             self.log(f'Bloc {old.label} terminé → {self.current.label}')
 
     def _confirmed(self, identifier):
@@ -467,6 +587,7 @@ class WorkflowRunner:
         if self._confirmed('quota-cleared:' + obs.state):
             if node.params.get('resume','manual') == 'manual' and not self.approved:
                 self.phase = 'approval'
+                self._checkpoint()
                 self.log('Quota écoulé et disparu · approbation locale requise')
                 return
             self.log('Quota disparu et heure dépassée · suite du scénario autorisée')
@@ -555,6 +676,7 @@ class WorkflowRunner:
                 return
             if self.engine.config['mode'] == 'approval' and not self.approved:
                 self.phase = 'approval'
+                self._checkpoint()
                 self.log('Confirmation locale requise pour envoyer le prochain prompt')
                 return
             if self.engine.pending_approval:
@@ -568,6 +690,14 @@ class WorkflowRunner:
                 return
             self.send_attempted = True
             try:
+                # Persist the at-most-once barrier BEFORE invoking xdotool.
+                # If the disk write fails, no keystroke is attempted.
+                self._checkpoint()
+            except Exception:
+                self.phase = 'paused'
+                self.last_reason = 'Checkpoint non sauvegardé : aucun envoi effectué'
+                raise
+            try:
                 delivered = self.engine.send('workflow', prompt_override=p['prompt'])
             except Exception:
                 delivered = False
@@ -580,6 +710,7 @@ class WorkflowRunner:
             self.stable = 0
             self.last_match = None
             self.approved = False
+            self._checkpoint()
             self.log('Prompt du scénario envoyé · attente d’une nouvelle fin vérifiée')
         elif kind == 'scroll':
             # Scheduler rechecks project and restores focus and pointer.

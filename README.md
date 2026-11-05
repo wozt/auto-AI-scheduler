@@ -295,3 +295,38 @@ critical edits without interactive verification on Devin/KDE.
 
 No screenshot or OCR transcript is committed, stored or emailed by this patch.
 The new tests use only synthetic OCR observations and throwaway local images.
+
+## Durable workflow checkpoints (patch 0009)
+
+The visual workflow executor now saves a **private metadata-only checkpoint**
+under `~/.local/state/auto-ai-scheduler/workflow-checkpoint.json` (mode 0600,
+parent directory 0700). It records only the workflow SHA-256 fingerprint,
+block ID, executor phase, delivery uncertainty and update time. No prompts,
+reference images, OCR transcripts, SMTP details, project names or screenshots
+are included in the checkpoint. Workflows and OCR proofs remain in their
+existing private local stores.
+
+A restart **never auto-resumes**. The timeline shows an outstanding checkpoint
+and offers **↶ Restaurer**, which loads the exact saved workflow *paused*.
+Click ▶ Scénario to explicitly resume. Waiting timers start afresh; OCR,
+Codex state, branch decisions and quota reset must be revalidated from live
+observations. If the current step was an unsent prompt, restoration rewinds
+to its unique incoming condition so a stale proof cannot authorize typing.
+
+Before any live Send block, an **attempted** checkpoint is durably written.
+If the application closes after a send attempt or while waiting for its
+response, restoration remains blocked: the operator must inspect Codex and
+**explicitly** discard the checkpoint before rearming. No automatic replay
+of a potentially delivered prompt occurs. The **✕ Effacer reprise** button
+requires confirmation. Completed scenarios and ordinary stops clear their checkpoint.
+**Stop does not erase a checkpoint when a prompt may already have been sent**;
+use the separately confirmed Effacer reprise action after inspecting Codex. This does not promise exactly-once execution after a user chooses
+to discard a checkpoint and manually rearm a scenario.
+
+Play (classic supervisor) is also refused while a workflow recovery is
+pending, avoiding two automation engines racing to type in Devin. The feature
+is for the currently saved default workflow; edited workflows cannot inherit
+checkpoints from an older version of their graph.
+
+Run with `./start.sh` and verify in your Debian KDE X11 desktop; headless
+checks validate the checkpoint state machine but cannot verify the live GUI.
