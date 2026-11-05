@@ -1,0 +1,8 @@
+[project]
+name = "auto-ai-scheduler"
+version = "0.1.0"
+description = "GTK4 X11 visual scheduler for Codex in Devin Desktop"
+requires-python = ">=3.11"
+
+[project.scripts]
+auto-ai-scheduler = "auto_ai_scheduler.gui:launch"

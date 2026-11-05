@@ -1,0 +1,53 @@
+# Auto AI Scheduler — GTK4 prototype for Devin Desktop / Codex
+
+An **opt-in X11 desktop automation skeleton**. Its default mode is manual.
+It does not use private Codex APIs, bypass quotas, or modify project files.
+
+## Design contract
+
+- **No Devin:** `xdotool search --onlyvisible --name Devin` returns no windows; nothing is clicked, typed or scrolled.
+- **Correct project only:** for each candidate Devin window, activate by ID and OCR the **Explorer header and project name just below it**. `metroidvania` in chat content is not sufficient. Require Codex UI indicators in that same window as well.
+- **No blind Alt+Tab:** activate a known window ID, test it, and restore the previous active window and the exact mouse coordinates **immediately after each candidate/action**. A `finally` block handles normal and error exits. The user's clipboard is never touched.
+- **Do not steal control for every frame:** OCR discovery currently activates each candidate window briefly; for users who are actively typing, use only when unattended. A future backend should use reliable offscreen window captures and avoid focus changes during observation.
+- **No unsafe automatic sending:** `Edited N files` + `Worked for` is only a potential completion. Require repeat observations, a different marker after an actual send, a cooldown, a cycle limit, a visible composer, and no quota/error. OCR cannot trigger shell commands.
+- **Quota:** no sends while quota is visible. When quota disappears, manual approval is required; email-only approval is not implemented.
+- **Periodic scroll:** every minute when monitoring, only if project and Codex are found; it also restores the mouse and focus.
+- **Mail:** SMTP notifications on prompt/error/completion are optional. `AUTO_AI_SMTP_USER` and `AUTO_AI_SMTP_PASSWORD` hold credentials. Email confirmation (IMAP) is future work; currently the "Approuver" button is local.
+
+**Known limitations:** The Codex pane might be hidden, the Explorer collapsed, another window obscuring Devin, X11 security prompts or screen lock can defeat OCR. This prototype only types one-line prompts. Its state is in memory; it does not yet schedule a future absolute date, automatically restart on login, save pending cycles, or read replies by IMAP. Do not leave it unattended for critical changes until live tests on your workstation pass.
+
+## Debian 13 install and run
+
+```bash
+sudo apt update
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 \
+  xdotool tesseract-ocr tesseract-ocr-eng python3-pil python3-pytesseract
+cd ~/dev/auto-AI-scheduler
+python3 -m unittest discover -s tests -v
+python3 -m auto_ai_scheduler
+```
+
+If you are still using the previous `codex-guard` service, stop it before launching this prototype to avoid two automation processes fighting for the mouse.
+
+## UI
+
+- **Projet cible:** the precise folder name in the Explorer (example: `metroidvania`).
+- **Titre de fenêtre IDE:** regex matched by xdotool (default `Devin`).
+- **Prompt:** a single-line message (default `continue`).
+- **Modes:** manual / automatic / local approval. Automatic is explicit opt-in; do not start without checking the target.
+- **Tester la détection:** visit visible Devin windows, OCR, restore your original window/pointer.
+- **Envoyer maintenant:** single guarded send with a visible composer.
+- **Démarrer / Arrêter:** enable or disable the periodic monitor.
+
+## Future milestones
+
+1. Offscreen X11 capture and in-focus user activity protection.
+2. Region detection and confidence score for multiple IDE layouts.
+3. Absolute datetime scheduler, persistence and systemd integration.
+4. OCR reset-date parsing and resumed cycle handling, including DST.
+5. SMTP reports, signed IMAP approvals, redacted attachments, and audit log.
+6. GUI queue of multiple projects/prompts, stop-on-failure policies, screenshots and tests.
+
+## Screenshots
+
+Reference screenshots in `references/` demonstrate Explorer recognition, completed Codex cycle, and usage-limit banner. No screenshots are emailed by default.
