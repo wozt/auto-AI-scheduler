@@ -25,4 +25,10 @@ def css(font_size):
             '.scheduler-panel {padding:6px;} '
             '.scheduler-timeline {background:alpha(@window_fg_color,.027);}'
             '.scheduler-clip-active {outline:2px solid #50c983;outline-offset:-2px;}'
+            '.scheduler-trace-done {border:1px solid #42a576;}'
+            '.scheduler-trace-ocr_yes {border:1px solid #d7b34b;}'
+            '.scheduler-trace-ocr_no {border:1px solid #ab8156;}'
+            '.scheduler-trace-timeout, .scheduler-trace-blocked {border:2px solid #dd6a57;}'
+            '.scheduler-trace-attempt {border:2px solid #deae46;}'
+            '.scheduler-trace-active, .scheduler-trace-response {border:1px solid #76a3dc;}'
             '.scheduler-root button {min-height:26px;}').encode('utf-8')

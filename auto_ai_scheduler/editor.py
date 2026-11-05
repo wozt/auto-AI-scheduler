@@ -149,7 +149,7 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12):
     return area
 
 
-def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None):
+def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None, trace=None):
     """Resizable bottom timeline: each ordered node is a time-track clip.
 
     Proof images only load from the user's private, local store.
@@ -159,6 +159,10 @@ def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None):
     heading=Gtk.Label(label='TIMELINE  ·  Scénario en lecture / édition',xalign=0)
     heading.set_hexpand(True)
     header.append(heading)
+    legend=Gtk.Label(label='✓ Terminé  ·  ◐ Preuve OCR  ·  ! Bloqué  ·  ⌛ Timeout',xalign=1)
+    legend.set_tooltip_text('Les indicateurs décrivent la session actuelle ; ils ne sont jamais des preuves suffisantes pour envoyer un prompt.')
+    legend.add_css_class('scheduler-small')
+    header.append(legend)
     wrap.append(header)
     scroll=Gtk.ScrolledWindow()
     scroll.set_policy(Gtk.PolicyType.AUTOMATIC,Gtk.PolicyType.NEVER)
@@ -170,8 +174,27 @@ def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None):
     track.set_margin_bottom(7)
     track.set_margin_start(8)
     scroll.set_child(track)
+    markers = {}
+    trace_classes = tuple('scheduler-trace-' + status for status in (
+        'active', 'waiting', 'ocr_yes', 'ocr_no', 'done', 'paused',
+        'blocked', 'timeout', 'attempt', 'response', 'restored'))
+
+    def update_trace():
+        if trace is None:
+            return
+        for ident, (frame, indicator) in markers.items():
+            entry = trace.latest.get(ident)
+            label, detail = trace.summary(ident)
+            indicator.set_text(label)
+            indicator.set_tooltip_text(detail)
+            frame.set_tooltip_text(detail)
+            for css_class in trace_classes:
+                frame.remove_css_class(css_class)
+            if entry is not None:
+                frame.add_css_class('scheduler-trace-' + entry.status)
 
     def reload():
+        markers.clear()
         child=track.get_first_child()
         while child is not None:
             next_child=child.get_next_sibling()
@@ -181,7 +204,7 @@ def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None):
             frame=Gtk.Frame()
             if active_id is not None and active_id()==node.id:
                 frame.add_css_class('scheduler-clip-active')
-            frame.set_size_request(178,125)
+            frame.set_size_request(186,151)
             content=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=5)
             for margin in ('start','end','top','bottom'):
                 getattr(content,'set_margin_'+margin)(6)
@@ -206,11 +229,18 @@ def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None):
             caption.set_ellipsize(3)  # Pango.EllipsizeMode.END
             caption.add_css_class('scheduler-small')
             content.append(caption)
+            indicator=Gtk.Label(label='· Non exécuté',xalign=0)
+            indicator.add_css_class('scheduler-small')
+            indicator.set_ellipsize(3)
+            indicator.set_tooltip_text('Étape non exécutée dans cette session')
+            content.append(indicator)
+            markers[node.id]=(frame,indicator)
             frame.set_child(content)
             gesture=Gtk.GestureClick()
             gesture.connect('pressed',lambda _g,_c,_x,_y, ident=node.id:on_select(ident))
             frame.add_controller(gesture)
             track.append(frame)
+        update_trace()
 
     reload()
-    return wrap,reload
+    return wrap,reload,update_trace

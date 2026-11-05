@@ -16,6 +16,7 @@ from . import schedule, x11
 from .proofs import match_text, ocr_image, parse_roi
 from .workflow import Workflow
 from .workflow_checkpoint import CheckpointStore, graph_fingerprint
+from .workflow_trace import TraceJournal
 
 TRIGGERS = {'clock', 'delay', 'event'}
 CONDITIONS = {'ocr', 'state'}
@@ -280,6 +281,7 @@ class WorkflowRunner:
         self.checkpoints = checkpoints
         self.workflow_digest = None
         self.recovered = False
+        self.trace = TraceJournal(self.monotonic)
 
     def _checkpoint(self):
         if self.checkpoints is None or self.workflow_digest is None:
@@ -348,6 +350,9 @@ class WorkflowRunner:
                             'Reprise chargée en pause : cliquez sur Scénario pour reprendre et revérifier.')
         # Preserve an older 'attempted' checkpoint as a hard block.
         self._checkpoint()
+        self.trace.reset()
+        self.trace.enter(self.current)
+        self.trace.record(self.current, 'restored', 'restored')
         self.log(f'Restauration au bloc {self.current.label} · {self.last_reason}')
         return True
 
@@ -399,12 +404,23 @@ class WorkflowRunner:
         except Exception:
             self.phase = 'stopped'
             raise
+        self.trace.reset()
+        self.trace.enter(self.current)
         self.log(f'Scénario armé : {len(path)} blocs · aucune action sans vérification')
 
     def pause(self, reason='Pause demandée'):
         if self.phase in ('running', 'approval'):
             self.phase = 'paused'
             self.last_reason = reason
+            if self.current is not None:
+                code = ('timeout' if reason.startswith('Timeout') else
+                        'response_blocked' if reason.startswith('Réponse interrompue') else
+                        'send_unconfirmed' if reason.startswith('Envoi non confirmé') else
+                        'idle_unavailable' if reason.startswith('Détection d’inactivité') else
+                        'approval' if reason.startswith('Approbation') else
+                        'manual_pause' if reason == 'Pause demandée' else 'safety_block')
+                self.trace.record(self.current, 'timeout' if code == 'timeout' else
+                                  'paused' if code == 'manual_pause' else 'blocked', code)
             self._checkpoint()
             self.log(reason)
             return True
@@ -425,12 +441,16 @@ class WorkflowRunner:
             self.entered_at = self.monotonic()
             self.recovered = False
         self._checkpoint()
+        if self.current is not None:
+            self.trace.record(self.current, 'active', 'resumed')
         self.log('Scénario repris · contrôles de sécurité conservés')
         return True
 
     def stop(self):
         if self.phase == 'stopped':
             return False
+        if self.current is not None:
+            self.trace.record(self.current, 'paused', 'manual_stop')
         # Stop must NEVER silently erase evidence of a possibly delivered
         # prompt. Only the separate, confirmed Forget action can do that.
         unsafe_send = self.send_attempted or self.waiting_response
@@ -455,14 +475,23 @@ class WorkflowRunner:
         self.approved = True
         self.phase = 'running'
         self._checkpoint()
+        if self.current is not None:
+            self.trace.record(self.current, 'active', 'resumed')
         self.log('Prochain envoi du scénario approuvé localement')
         return True
 
     def _advance(self, route='next'):
         old = self.current
+        now = self.monotonic()
+        reason = ('branch_yes' if route == 'yes' else 'branch_no' if route == 'no' else
+                  'ocr_confirmed' if old.kind == 'ocr' else
+                  'state_confirmed' if old.kind == 'state' else
+                  'quota_confirmed' if old.kind == 'quota_wait' else
+                  'send_done' if old.kind == 'send' else 'complete')
+        self.trace.record(old, 'done', reason, at=now)
         destination = self.links.get(old.id, {}).get(route)
         self.index = self.positions[destination] if destination is not None else len(self.path)
-        self.entered_at = self.monotonic()
+        self.entered_at = now
         self.stable = 0
         self.last_match = None
         self.saw_running = False
@@ -475,6 +504,7 @@ class WorkflowRunner:
             self.log('Scénario terminé · aucune reprise automatique')
         else:
             self._checkpoint()
+            self.trace.enter(self.current, at=now)
             self.log(f'Bloc {old.label} terminé → {self.current.label}')
 
     def _confirmed(self, identifier):
@@ -498,11 +528,13 @@ class WorkflowRunner:
     def _response_tick(self, now):
         obs, _ = self._observe()
         if obs is None:
+            self.trace.record(self.current, 'waiting', 'no_target', at=now)
             return
         if obs.state in ('QUOTA', 'ERROR'):
             self.pause('Réponse interrompue : ' + obs.state + ' · reprise manuelle requise')
             return
         if now - self.sent_at < 25:
+            self.trace.record(self.current, 'response', 'response_wait', at=now)
             return
         marker = obs.cycle_marker
         if (obs.state == 'FINISHED' and obs.composer is not None and marker and
@@ -510,6 +542,7 @@ class WorkflowRunner:
             self.waiting_response = False
             self.engine.session.waiting_for_response = False
             self.log('Réponse Codex terminée et vérifiée deux fois')
+            self.trace.record(self.current, 'response', 'response_confirmed', at=now)
             self._advance()
         elif obs.state != 'FINISHED' or not marker or marker == self.sent_marker:
             self._confirmed(None)
@@ -518,6 +551,7 @@ class WorkflowRunner:
         p = node.params
         obs, image = self._observe(require_image=p.get('source') == 'ocr')
         if obs is None:
+            self.trace.record(node, 'waiting', 'no_target', at=now)
             self._confirmed(None)
             return
         # An unexpected quota, error or still-busy response is NOT a reliable
@@ -537,16 +571,21 @@ class WorkflowRunner:
             marker = 'state:' + obs.state
         else:
             if image is None or obs.state not in ('READY','FINISHED'):
+                self.trace.record(node, 'waiting', 'ocr_unavailable', at=now)
                 self._confirmed(None)
                 return
             try:
                 actual = ocr_image(image, p['roi'])
                 if not actual.strip():
+                    self.trace.record(node, 'ocr_no', 'ocr_missing', at=now)
                     self._confirmed(None)
                     return
                 direction = 'yes' if match_text(actual,p['expected']) else 'no'
                 marker = hashlib.sha256(actual.casefold().encode()).hexdigest()[:16]
+                self.trace.record(node, 'ocr_yes' if direction == 'yes' else 'ocr_no',
+                                  'ocr_first' if direction == 'yes' else 'ocr_missing', at=now)
             except Exception:
+                self.trace.record(node, 'waiting', 'ocr_error', at=now)
                 self._confirmed(None)
                 return
         if self._confirmed('branch:' + direction + ':' + marker):
@@ -563,6 +602,7 @@ class WorkflowRunner:
             return
         wall_now = self.wall_clock()
         if obs.state == 'QUOTA':
+            self.trace.record(node, 'waiting', 'quota_active', at=now)
             deadline = parse_quota_reset(obs.reset_text)
             # A deadline in the past suggests stale/misread OCR. No guessing.
             if deadline is None or deadline + timedelta(minutes=5) < wall_now:
@@ -579,6 +619,7 @@ class WorkflowRunner:
             self._confirmed(None)
             return
         if wall_now < self.quota_deadline:
+            self.trace.record(node, 'waiting', 'quota_active', at=now)
             self._confirmed(None)
             return
         if obs.state not in ('READY','FINISHED') or obs.composer is None:
@@ -587,6 +628,7 @@ class WorkflowRunner:
         if self._confirmed('quota-cleared:' + obs.state):
             if node.params.get('resume','manual') == 'manual' and not self.approved:
                 self.phase = 'approval'
+                self.trace.record(node, 'paused', 'approval', at=now)
                 self._checkpoint()
                 self.log('Quota écoulé et disparu · approbation locale requise')
                 return
@@ -635,6 +677,7 @@ class WorkflowRunner:
         elif kind in ('event', 'state', 'ocr'):
             obs, image = self._observe(require_image=kind == 'ocr')
             if obs is None:
+                self.trace.record(node, 'waiting', 'no_target', at=now)
                 self._confirmed(None)
                 return
             if kind == 'event':
@@ -651,15 +694,23 @@ class WorkflowRunner:
                     key = 'event:' + want if obs.state == want else None
             elif kind == 'state':
                 key = 'state:' + p['state'] if obs.state == p['state'] else None
+                self.trace.record(node, 'ocr_yes' if key else 'waiting',
+                                  'state_first' if key else 'state_missing', at=now)
             else:
                 if image is None or obs.state in ('QUOTA','ERROR','RUNNING'):
                     key = None
+                    self.trace.record(node, 'waiting', 'codex_busy', at=now)
                 else:
                     try:
                         actual = ocr_image(image, p['roi'])
                         key = 'ocr:' + node.id if match_text(actual, p['expected']) else None
+                        self.trace.record(node, 'ocr_yes' if key else 'ocr_no',
+                                          'ocr_first' if key else 'ocr_missing', at=now)
                     except Exception:
                         key = None
+                        self.trace.record(node, 'waiting', 'ocr_error', at=now)
+            if kind == 'event' and not key:
+                self.trace.record(node, 'waiting', 'event_wait', at=now)
             if self._confirmed(key):
                 if kind in CONDITIONS:
                     self.evidence_at = now
@@ -697,6 +748,7 @@ class WorkflowRunner:
                 self.phase = 'paused'
                 self.last_reason = 'Checkpoint non sauvegardé : aucun envoi effectué'
                 raise
+            self.trace.record(node, 'attempt', 'send_attempt', at=now)
             try:
                 delivered = self.engine.send('workflow', prompt_override=p['prompt'])
             except Exception:
@@ -711,6 +763,7 @@ class WorkflowRunner:
             self.last_match = None
             self.approved = False
             self._checkpoint()
+            self.trace.record(node, 'response', 'response_wait', at=now)
             self.log('Prompt du scénario envoyé · attente d’une nouvelle fin vérifiée')
         elif kind == 'scroll':
             # Scheduler rechecks project and restores focus and pointer.

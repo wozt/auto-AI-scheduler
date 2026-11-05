@@ -86,6 +86,9 @@ def launch():
             self.log_widget=None
             self.canvas=None
             self.timeline_reload=None
+            self.timeline_update_trace=None
+            self.trace_widget=None
+            self._shown_trace_revision=-1
             self.inspector=None
             self.preview=None
             self.css_provider=None
@@ -309,33 +312,61 @@ def launch():
             self.runner_label.set_ellipsize(Pango.EllipsizeMode.END)
             self.runner_label.set_tooltip_text('Indique le bloc en attente ou en cours. Les scénarios sont exécutés uniquement après un clic sur Scénario.')
             bar.append(self.runner_label)
-            timeline,reload=self._timeline_components()
+            timeline,reload,update_trace=self._timeline_components()
             self.timeline_reload=reload
+            self.timeline_update_trace=update_trace
             timeline.set_vexpand(True)
             lower.append(timeline)
-            bottom=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=5)
-            lower.append(bottom)
-            lbl=Gtk.Label(label='Journal',xalign=0)
-            lbl.set_tooltip_text('Liste locale des événements, sans enregistrement de screenshots.')
-            bottom.append(lbl)
+            # Resizable dual journal: structured, redacted execution trace on
+            # the left; existing human-readable application messages on right.
+            # Both remain inside the bottom timeline panel.
+            split=Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+            split.set_wide_handle(True)
+            split.set_shrink_start_child(True)
+            split.set_shrink_end_child(True)
+            split.set_size_request(-1,95)
+            lower.append(split)
+
+            trace_panel=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=3)
+            trace_title=Gtk.Label(label='JOURNAL D’EXÉCUTION · heure / bloc / durée / résultat',xalign=0)
+            trace_title.add_css_class('scheduler-small')
+            trace_title.set_tooltip_text('Statuts structurés uniquement : aucun texte OCR, prompt ou capture n’est conservé dans ce journal (mémoire de session).')
+            trace_panel.append(trace_title)
+            trace_scroll=Gtk.ScrolledWindow()
+            trace_scroll.set_vexpand(True)
+            self.trace_widget=Gtk.TextView(editable=False,cursor_visible=False,monospace=True)
+            self.trace_widget.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+            self.trace_widget.add_css_class('scheduler-small')
+            self.trace_widget.set_tooltip_text('Le statut et la durée de chaque bloc sont aussi visibles sur les miniatures ci-dessus.')
+            trace_scroll.set_child(self.trace_widget)
+            trace_panel.append(trace_scroll)
+            split.set_start_child(trace_panel)
+
+            log_panel=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=3)
+            lbl=Gtk.Label(label='JOURNAL GÉNÉRAL · messages de surveillance',xalign=0)
+            lbl.add_css_class('scheduler-small')
+            lbl.set_tooltip_text('Liste des messages locaux du superviseur.')
+            log_panel.append(lbl)
             logscroll=Gtk.ScrolledWindow()
-            logscroll.set_min_content_height(45)
-            logscroll.set_size_request(-1,53)
-            logscroll.set_hexpand(True)
+            logscroll.set_vexpand(True)
             self.log_widget=Gtk.TextView(editable=False,cursor_visible=False,monospace=True)
             self.log_widget.add_css_class('scheduler-small')
             logscroll.set_child(self.log_widget)
-            bottom.append(logscroll)
+            log_panel.append(logscroll)
+            split.set_end_child(log_panel)
+            split.set_position(max(380,self.cfg['window_width']//2))
             return lower
 
         def _timeline_components(self):
             return editor.timeline_widget(Gtk,self.graph,self.proof_store,self.select_node,
-                                          active_id=lambda: self.runner.current.id if self.runner.phase in ('running','paused','approval') and self.runner.current else None)
+                                          active_id=lambda: self.runner.current.id if self.runner.phase in ('running','paused','approval') and self.runner.current else None,
+                                          trace=self.runner.trace)
 
         def graph_changed(self):
             self.workflow_store.save(self.graph)
             if self.canvas:self.canvas.queue_draw()
             if self.timeline_reload:self.timeline_reload()
+            if self.timeline_update_trace:self.timeline_update_trace()
 
         def add_node(self,kind):
             count=len(self.graph.nodes)
@@ -765,6 +796,15 @@ def launch():
             if self._displayed_step!=displayed:
                 self._displayed_step=displayed
                 if self.timeline_reload:self.timeline_reload()
+            if self.timeline_update_trace:
+                self.timeline_update_trace()
+            if self.trace_widget is not None and self._shown_trace_revision != self.runner.trace.revision:
+                # The trace contains only predefined status/reason descriptions.
+                # Never show OCR strings, prompts or raw exception messages.
+                lines=self.runner.trace.lines({node.id:node.label for node in self.runner.path})
+                self.trace_widget.get_buffer().set_text(
+                    '\n'.join(lines) if lines else 'Aucune étape exécutée dans cette session.')
+                self._shown_trace_revision=self.runner.trace.revision
             self.next_label.set_tooltip_text(upcoming)
             if 'force_test' in self.buttons:
                 self.buttons['force_test'].set_sensitive(

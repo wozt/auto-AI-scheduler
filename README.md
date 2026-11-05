@@ -330,3 +330,24 @@ checkpoints from an older version of their graph.
 
 Run with `./start.sh` and verify in your Debian KDE X11 desktop; headless
 checks validate the checkpoint state machine but cannot verify the live GUI.
+
+## Structured execution journal (patch 0010)
+
+The resizable **bottom timeline** now shows a per-block status and elapsed time
+below each clip. Completed steps are highlighted in green, OCR results in
+amber, and blocked or timed-out steps in red. Tooltips describe the exact
+status and time spent in that block. The timeline includes two horizontally
+resizable journal panels: a **structured execution history** (time, block,
+duration, reason) and the existing general supervisor log.
+
+This journal uses an **allowlisted set of status/reason codes**. It never saves
+or displays raw OCR results, prompts, imported proof images, window titles or
+exception strings. It is bounded to the latest 200 events **in memory only**;
+a restart restores the safe workflow checkpoint, not the previous trace. An
+OCR match requires the existing two independent observations and does not
+itself send a prompt. Failed verification is displayed without bypassing any
+existing X11, quota, cooldown or one-shot-send protection.
+
+Run `./start.sh` and launch a scenario with `▶ Scénario` to see live statuses.
+Resize the vertical separator to make the timeline taller, or drag the
+separator between the structured and general logs.
