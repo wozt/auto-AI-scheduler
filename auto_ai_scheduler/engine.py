@@ -7,7 +7,7 @@ import os
 import smtplib
 import ssl
 import time
-from . import vision, x11
+from . import vision, x11, config as settings, schedule
 
 
 @dataclass
@@ -30,6 +30,9 @@ class Scheduler:
         self.session = Session()
         self.enabled = False
         self.pending_approval = False
+        self.claims = schedule.ClaimStore()
+        self._last_poll = 0.0
+        self._last_idle_warning = 0.0
 
     def _notify(self, subject, body):
         c = self.config
@@ -93,10 +96,15 @@ class Scheduler:
             if obs.state not in ('READY','FINISHED') or obs.composer is None:
                 self.log(f'UI state {obs.state}: no send')
                 return
-            if reason != 'manual' and (obs.state != 'FINISHED' or self.session.stable < 2):
+            if reason == 'auto' and (obs.state != 'FINISHED' or self.session.stable < 2):
                 self.log('Unstable cycle completion: no automatic send')
                 return
             abs_xy = (offset[0]+obs.composer[0], offset[1]+obs.composer[1])
+            if reason == 'scheduled':
+                key = schedule.job_id(self.config)
+                if not self.claims.claim(key):
+                    self.log('Scheduled prompt already claimed; no duplicate send')
+                    return
             x11.type_and_send(wid,abs_xy,self.config['prompt'])
             self.session.last_sent = time.monotonic()
             self.session.baseline_marker = obs.cycle_marker
@@ -126,6 +134,35 @@ class Scheduler:
         if not self.enabled:
             return
         now = time.monotonic()
+        # A background scan must never grab focus while the user is active.
+        try:
+            if x11.user_idle_seconds() < self.config['idle_seconds']:
+                return
+        except Exception as exc:
+            if now - self._last_idle_warning > 60:
+                self.log(f'Idle safety unavailable; monitor paused: {exc}')
+                self._last_idle_warning = now
+            return
+
+        # A scheduled message is an explicit user request and does not require
+        # the previous response to carry an Edited-files marker.
+        if schedule.due(self.config):
+            key = schedule.job_id(self.config)
+            if self.claims.contains(key):
+                # Never retry a potentially sent prompt after a crash.
+                if self.config['schedule_enabled']:
+                    self.log('Scheduled job already attempted; re-arm to send again')
+                    self.config['schedule_enabled'] = False
+                    settings.save(self.config)
+            elif self.send('scheduled'):
+                self.config['schedule_enabled'] = False
+                settings.save(self.config)
+                self.log('Scheduled prompt completed (one shot)')
+                return
+
+        if now - self._last_poll < self.config['poll_seconds']:
+            return
+        self._last_poll = now
         if self.config['scroll_seconds'] and now-self.session.last_scroll >= self.config['scroll_seconds']:
             self.scroll()
             self.session.last_scroll = now

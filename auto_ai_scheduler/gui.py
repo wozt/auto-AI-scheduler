@@ -1,5 +1,6 @@
 """GTK4 / libadwaita app. UI avoids manipulating IDE when stopped."""
 from datetime import datetime
+from uuid import uuid4
 from . import config
 from .engine import Scheduler
 
@@ -52,10 +53,22 @@ def launch():
             mode_row.set_selected(choices.index(self.cfg['mode']))
             group.add(mode_row)
 
+            planned=Adw.PreferencesGroup(title='Planification',description='Heure locale du PC. Devin et cette application doivent rester ouverts.')
+            prefs.append(planned)
+            scheduled=Adw.SwitchRow(title='Activer un envoi unique à heure fixe')
+            scheduled.set_active(bool(self.cfg['schedule_enabled']))
+            self.fields['schedule_enabled']=scheduled; planned.add(scheduled)
+            schedule_date=Adw.EntryRow(title='Date et heure (AAAA-MM-JJ HH:MM)')
+            schedule_date.set_text(self.cfg['scheduled_at'])
+            self.fields['scheduled_at']=schedule_date; planned.add(schedule_date)
+            scheduled.connect('notify::active',lambda *args: schedule_date.set_sensitive(scheduled.get_active()))
+            schedule_date.set_sensitive(scheduled.get_active())
+
             settings=Adw.PreferencesGroup(title='Surveillance',description='OCR local, sans API privée')
             prefs.append(settings)
-            for key,title in [('poll_seconds','Contrôle toutes les (secondes)'),('scroll_seconds','Défilement toutes les (secondes, 0 désactive)'),('scroll_steps','Crans de défilement'),('max_cycles','Cycles maximum'),('cooldown_seconds','Pause minimum entre envois (secondes)')]:
-                row=Adw.SpinRow.new_with_range(0 if key=='scroll_seconds' else 1,3600,1)
+            for key,title in [('poll_seconds','Contrôle toutes les (secondes)'),('scroll_seconds','Défilement toutes les (secondes, 0 désactive)'),('scroll_steps','Crans de défilement'),('max_cycles','Cycles maximum'),('cooldown_seconds','Pause minimum entre envois (secondes)'),
+                              ('idle_seconds','Inactivité requise avant action (secondes)')]:
+                row=Adw.SpinRow.new_with_range(0 if key in ('scroll_seconds','idle_seconds') else 1,3600,1)
                 row.set_title(title); row.set_value(self.cfg[key]); self.fields[key]=row; settings.add(row)
             mail=Adw.PreferencesGroup(title='Notifications mail (SMTP SSL)',description='Secrets dans AUTO_AI_SMTP_USER / AUTO_AI_SMTP_PASSWORD. Pas de confirmation par mail dans ce squelette.')
             prefs.append(mail)
@@ -83,28 +96,37 @@ def launch():
             try:
                 updated=dict(self.cfg)
                 for key,row in self.fields.items():
-                    if key=='email_enabled':updated[key]=row.get_active()
+                    if key in ('email_enabled','schedule_enabled'):updated[key]=row.get_active()
                     elif isinstance(row,Adw.SpinRow):updated[key]=int(row.get_value())
                     else:updated[key]=row.get_text()
                 updated['mode']=['manual','auto','approval'][self.mode_row.get_selected()]
+                if updated['schedule_enabled'] and (
+                    not self.cfg['schedule_enabled'] or
+                    any(updated[k] != self.cfg[k] for k in ('scheduled_at','project','prompt'))
+                ):
+                    updated['schedule_id'] = uuid4().hex
                 config.save(updated)
                 self.cfg=updated
                 self.engine.config=updated
                 self.log('Configuration enregistrée')
-            except Exception as exc:self.log(f'Configuration invalide : {exc}')
+                return True
+            except Exception as exc:
+                self.log(f'Configuration invalide : {exc}')
+                return False
 
         def detect(self,*_):
-            self.save()
+            if not self.save(): return
             obs=self.engine.inspect_target()
             if obs is None:self.log('Aucune fenêtre Devin+Codex avec le projet cible')
             else:self.log(f'Projet trouvé ; Codex={obs.state} ; champ={obs.composer}')
 
         def send(self,*_):
-            self.save()
+            if not self.save(): return
             self.engine.send('manual')
 
         def start(self,*_):
-            self.save(); self.engine.enabled=True
+            if not self.save(): return
+            self.engine.enabled=True
             self.log('Surveillance active (cette fenêtre GTK doit rester ouverte)')
 
         def stop(self,*_):
@@ -115,7 +137,10 @@ def launch():
             self.engine.approve()
 
         def _poll(self):
-            try:self.engine.tick()
+            try:
+                self.engine.tick()
+                if self.fields['schedule_enabled'].get_active() != self.cfg['schedule_enabled']:
+                    self.fields['schedule_enabled'].set_active(self.cfg['schedule_enabled'])
             except Exception as exc:self.log('Surveillance : '+str(exc))
             return True
 

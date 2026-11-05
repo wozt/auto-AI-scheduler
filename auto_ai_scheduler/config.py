@@ -1,5 +1,6 @@
 """Small, validated, user-local configuration."""
 import json
+from .schedule import parse_local
 from pathlib import Path
 
 CONFIG = Path.home() / '.config' / 'auto-ai-scheduler' / 'settings.json'
@@ -10,6 +11,8 @@ DEFAULTS = {
     'max_cycles': 10, 'cooldown_seconds': 60,
     'email_to': '', 'email_from': '', 'smtp_host': '', 'smtp_port': 465,
     'email_enabled': False, 'email_on_prompt': True, 'email_on_error': True,
+    'schedule_enabled': False, 'scheduled_at': '', 'schedule_id': '',
+    'idle_seconds': 8,
 }
 
 
@@ -21,10 +24,13 @@ def validate(cfg):
         raise ValueError('Invalid mode')
     for k, low, high in [('poll_seconds', 5, 3600), ('scroll_seconds', 0, 3600),
                          ('scroll_steps', 1, 80), ('max_cycles', 1, 100),
-                         ('cooldown_seconds', 15, 3600), ('smtp_port', 1, 65535)]:
+                         ('cooldown_seconds', 15, 3600), ('smtp_port', 1, 65535),
+                         ('idle_seconds', 0, 3600)]:
         cfg[k] = int(cfg[k])
         if not low <= cfg[k] <= high:
             raise ValueError(f'Invalid {k}')
+    if cfg['schedule_enabled']:
+        parse_local(cfg['scheduled_at'])
     return cfg
 
 

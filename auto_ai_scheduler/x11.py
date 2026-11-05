@@ -47,6 +47,14 @@ def temporary_focus(wid):
         restore(before)
 
 
+def user_idle_seconds():
+    """Read X11 idle time; fail closed if xprintidle is unavailable."""
+    raw = command('xprintidle')
+    if not raw.isdecimal():
+        raise RuntimeError('xprintidle produced no idle time')
+    return int(raw) / 1000.0
+
+
 def windows(pattern):
     """Find IDE top-level windows; do nothing when none are present."""
     ids = command('xdotool', 'search', '--onlyvisible', '--name', pattern, check=False)
