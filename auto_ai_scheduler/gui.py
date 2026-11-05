@@ -1,17 +1,18 @@
-"""Single-page, compact GTK4/libadwaita dashboard for Codex in Devin Desktop.
+"""Resizable GTK4 visual scenario editor with a bottom timeline.
 
-All X11 automation remains in Scheduler. Navigation buttons only browse the
-local history/next-action preview; they never send or undo Codex commands.
+The graph is an authoring/verification workspace: it is never executed by this
+UI. The legacy Scheduler is still the only component that can send to Codex.
 """
 from datetime import datetime
 from uuid import uuid4
 
-from . import config
+from . import config, display, x11
 from .control import RunControls, next_action, recent_target
 from .engine import Scheduler
+from .workflow import NODE_KINDS, WorkflowStore, planned_send
+from .proofs import ProofStore
+from . import editor
 
-
-# Keep a plain-Python manifest for headless UI coverage, matching patch 0003.
 LEFT_SECTIONS = (
     ('Cible X11', ('project', 'app_pattern', 'prompt', 'mode')),
     ('Planification', ('schedule_enabled', 'scheduled_at')),
@@ -20,402 +21,624 @@ RIGHT_SECTIONS = (
     ('Surveillance', ('poll_seconds', 'scroll_seconds', 'scroll_steps',
                       'max_cycles', 'cooldown_seconds', 'idle_seconds')),
     ('Notifications SMTP SSL', ('email_enabled', 'email_to', 'email_from',
-                                'smtp_host', 'smtp_port', 'email_on_prompt',
-                                'email_on_error')),
+                                'smtp_host', 'smtp_port', 'email_on_prompt', 'email_on_error')),
+    ('Affichage', ('window_width','window_height','font_size','theme')),
 )
-TRANSPORT_CONTROLS = ('previous', 'play', 'pause', 'stop', 'next')
+TRANSPORT_CONTROLS = ('previous','play','pause','stop','next')
+COMPACT_CSS = display.css(12) + b'\n.scheduler-state.found {color:#57c88d;} .scheduler-root {font-size: 12px;}\n'
 
-# Styling is applied to this app's main content only, not the system theme.
-COMPACT_CSS = b"""
-.scheduler-root { font-size: 12px; }
-.scheduler-root label { font-size: 12px; }
-.scheduler-section { border-radius: 8px; }
-.scheduler-settings-viewport { background: transparent; }
-.scheduler-section .scheduler-title { font-weight: 700; font-size: 13px; }
-.scheduler-section .scheduler-hint { font-size: 11px; opacity: 0.8; }
-.scheduler-row { min-height: 24px; }
-.scheduler-row entry { min-height: 23px; padding: 0px 6px; }
-.scheduler-row spinbutton { min-height: 23px; }
-.scheduler-row dropdown button { min-height: 23px; padding: 0px 6px; }
-.scheduler-row switch { margin: 0px; }
-.scheduler-controls button, .scheduler-tools button { min-height: 29px; padding: 3px 11px; }
-.scheduler-state { padding: 6px 11px; border-radius: 7px;
-  background: alpha(@window_fg_color, .045); border: 1px solid alpha(@window_fg_color, .12); }
-.scheduler-state.found { color: #57c88d;
-  background: alpha(#208a50, .14); border-color: alpha(#3dc57d, .42); }
-.scheduler-state .scheduler-next { font-size: 12px; }
-.scheduler-log { font-family: monospace; font-size: 11px; }
-.scheduler-event { font-size: 11px; opacity: .84; }
-"""
+HELP = {
+    'project':'Nom exact affiché sous Explorer dans Devin ; vérifié par OCR avant toute action.',
+    'app_pattern':'Expression utilisée par xdotool pour retrouver les fenêtres Devin.',
+    'prompt':'Texte envoyé uniquement après validation du projet et du champ Codex.',
+    'mode':'Manuel = jamais de reprise automatique ; Automatique = reprise sous conditions ; Confirmation = attendre votre accord.',
+    'schedule_enabled':'Active un envoi unique à une heure locale indiquée. La fenêtre doit rester ouverte.',
+    'scheduled_at':'Date et heure de l’ordinateur au format AAAA-MM-JJ HH:MM.',
+    'poll_seconds':'Intervalle entre deux vérifications OCR, en secondes.',
+    'scroll_seconds':'Intervalle de défilement vers le bas du chat Codex. 0 le désactive.',
+    'scroll_steps':'Nombre de crans de molette lorsque le défilement est demandé.',
+    'max_cycles':'Nombre maximum de prompts envoyés par cette session.',
+    'cooldown_seconds':'Protection contre des envois trop rapprochés.',
+    'idle_seconds':'Durée d’inactivité du bureau avant que le superviseur déplace le focus.',
+    'email_enabled':'Active l’envoi de notifications SMTP, pas de confirmation IMAP.',
+    'email_to':'Adresse qui reçoit les rapports.',
+    'email_from':'Adresse expéditrice du serveur SMTP.',
+    'smtp_host':'Nom d’hôte de votre serveur SMTP SSL.',
+    'smtp_port':'Port SSL habituel : 465.',
+    'email_on_prompt':'Un message après chaque envoi confirmé.',
+    'email_on_error':'Un message en cas d’erreur bloquant l’automatisation.',
+    'window_width':'Largeur de la fenêtre au démarrage, en pixels. Ajustable en direct.',
+    'window_height':'Hauteur de la fenêtre au démarrage, en pixels.',
+    'font_size':'Taille de texte de base ; les titres et en-têtes restent légèrement plus grands.',
+    'theme':'Apparence libadwaita : système, clair ou sombre.',
+}
 
 
 def launch():
     import gi
-    gi.require_version('Gtk', '4.0')
-    gi.require_version('Adw', '1')
-    from gi.repository import Gtk, Adw, GLib, Pango
+    gi.require_version('Gtk','4.0')
+    gi.require_version('Adw','1')
+    from gi.repository import Gtk,Adw,GLib,Pango
 
     class App(Adw.Application):
         def __init__(self):
             super().__init__(application_id='click.woztrium.AutoAIScheduler')
-            self.cfg = config.load()
-            self.engine = Scheduler(self.cfg, self.log)
-            self.controls = RunControls(self.engine)
-            self.fields = {}
-            self.buttons = {}
-            self.window = None
-            self.last_event = None
-            self.state_box = None
-            self.target_label = None
-            self.next_label = None
-            self.history_label = None
-            self.logs = None
-            self.status = None
-            self.mode_preview = None
+            self.cfg=config.load()
+            self.engine=Scheduler(self.cfg,self.log)
+            self.controls=RunControls(self.engine)
+            self.workflow_store=WorkflowStore()
+            self.proof_store=ProofStore()
+            self.graph=self.workflow_store.load()
+            self.selected=None
+            self.window=None
+            self.status=None
+            self.status_box=None
+            self.target_label=None
+            self.next_label=None
+            self.log_box=None
+            self.log_widget=None
+            self.canvas=None
+            self.timeline_reload=None
+            self.inspector=None
+            self.preview=None
+            self.css_provider=None
+            self.display_settings=None
+            self.buttons={}
+            self._save_timeout=None
 
-        def log(self, message):
-            stamp = datetime.now().strftime('%H:%M:%S')
-            entry = f'{stamp}  {message}'
-            self.controls.history.add(entry)
-            if self.status is not None:
-                self.status.set_text(message)
-            if self.logs is not None:
-                buffer = self.logs.get_buffer()
-                buffer.insert(buffer.get_end_iter(), entry + '\n')
-            self._refresh()
+        def log(self,message):
+            line=f'{datetime.now():%H:%M:%S}  {message}'
+            self.controls.history.add(line)
+            if self.status is not None:self.status.set_text(message)
+            if self.log_widget is not None:
+                buf=self.log_widget.get_buffer()
+                buf.insert(buf.get_end_iter(),line+'\n')
+            self.refresh()
 
-        def _section(self, title, hint=None):
-            frame = Gtk.Frame()
-            frame.add_css_class('scheduler-section')
-            frame.set_hexpand(True)
-            content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-            for side in ('start', 'end', 'top', 'bottom'):
-                getattr(content, f'set_margin_{side}')(5)
-            heading = Gtk.Label(label=title, xalign=0)
-            heading.add_css_class('scheduler-title')
-            content.append(heading)
-            if hint:
-                note = Gtk.Label(label=hint, xalign=0, wrap=True)
-                note.add_css_class('scheduler-hint')
-                content.append(note)
-            frame.set_child(content)
-            return frame, content
+        def css_apply(self):
+            if self.css_provider is None:return
+            self.css_provider.load_from_data(display.css(self.cfg['font_size']))
+            scheme={'system':Adw.ColorScheme.DEFAULT, 'dark':Adw.ColorScheme.FORCE_DARK,
+                    'light':Adw.ColorScheme.FORCE_LIGHT}[self.cfg['theme']]
+            Adw.StyleManager.get_default().set_color_scheme(scheme)
 
-        def _field(self, panel, key, title, kind='text', bounds=None):
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-            row.add_css_class('scheduler-row')
-            caption = Gtk.Label(label=title, xalign=0)
-            caption.set_hexpand(True)
-            caption.set_tooltip_text(title)
-            row.append(caption)
-            if kind == 'switch':
-                widget = Gtk.Switch()
-                widget.set_active(bool(self.cfg[key]))
-                widget.set_valign(Gtk.Align.CENTER)
-            elif kind == 'spin':
-                low, high = bounds
-                widget = Gtk.SpinButton.new_with_range(low, high, 1)
-                widget.set_value(int(self.cfg[key]))
-                widget.set_numeric(True)
-                widget.set_width_chars(5)
-            elif kind == 'mode':
-                widget = Gtk.DropDown.new_from_strings([
-                    'Manuel', 'Automatique', 'Confirmation locale'])
-                widget.set_selected(['manual', 'auto', 'approval'].index(self.cfg['mode']))
-            else:
-                widget = Gtk.Entry()
-                widget.set_text(str(self.cfg[key]))
-                widget.set_width_chars(15)
-                widget.set_hexpand(True)
-            if kind != 'text':
-                widget.set_halign(Gtk.Align.END)
-            row.append(widget)
-            panel.append(row)
-            self.fields[key] = widget
-            return widget
+        def status_line(self):
+            state=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=14)
+            state.add_css_class('scheduler-status')
+            state.add_css_class('scheduler-state')
+            self.status_box=state
+            self.target_label=Gtk.Label(label='Fenêtre : non vérifiée',xalign=0)
+            self.target_label.set_hexpand(True)
+            self.target_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+            self.target_label.set_tooltip_text('Vert uniquement après OCR récent du projet et de Codex.')
+            state.append(self.target_label)
+            self.next_label=Gtk.Label(label='Prochaine : Play',xalign=1)
+            self.next_label.set_hexpand(True)
+            self.next_label.set_ellipsize(Pango.EllipsizeMode.END)
+            state.append(self.next_label)
+            return state
 
-        def _button(self, parent, key, title, callback, tooltip):
-            btn = Gtk.Button(label=title)
-            btn.set_tooltip_text(tooltip)
-            btn.set_hexpand(True)
-            btn.connect('clicked', callback)
-            parent.append(btn)
-            self.buttons[key] = btn
+        def button(self,box,key,label,callback,help_text):
+            btn=Gtk.Button(label=label)
+            btn.set_tooltip_text(help_text)
+            btn.connect('clicked',callback)
+            box.append(btn)
+            self.buttons[key]=btn
             return btn
 
         def do_activate(self):
-            if self.window is not None:
+            if self.window:
                 self.window.present()
                 return
-            win = Adw.ApplicationWindow(application=self)
-            self.window = win
-            win.set_title('Auto AI Scheduler')
-            win.set_default_size(1160, 700)
-            # Request only a modest minimum. GTK can otherwise demand the
-            # entire natural height of every setting row (733px+ on KDE).
-            # The settings viewport below handles smaller allocations safely.
-            win.set_size_request(910, 480)
-
-            css = Gtk.CssProvider()
-            css.load_from_data(COMPACT_CSS)
+            win=Adw.ApplicationWindow(application=self)
+            self.window=win
+            win.set_title('Auto AI Scheduler · Visual Workflow')
+            win.set_default_size(self.cfg['window_width'],self.cfg['window_height'])
+            win.set_size_request(920,560)
+            self.css_provider=Gtk.CssProvider()
             Gtk.StyleContext.add_provider_for_display(
-                win.get_display(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+                win.get_display(),self.css_provider,Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+            self.css_apply()
 
-            toolbar = Adw.ToolbarView()
-            toolbar.add_top_bar(Adw.HeaderBar())
-            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            toolbar=Adw.ToolbarView()
+            header=Adw.HeaderBar()
+            heading=Gtk.Label(label='Auto AI Scheduler  ·  Scénarios',xalign=0)
+            heading.add_css_class('scheduler-title')
+            header.set_title_widget(heading)
+            prefs=Gtk.Button(label='⚙ Préférences')
+            prefs.set_tooltip_text('Ouvre les réglages du superviseur et de l’affichage, notamment résolution et police.')
+            prefs.connect('clicked',self.open_preferences)
+            header.pack_end(prefs)
+            toolbar.add_top_bar(header)
+            root=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=5)
             root.add_css_class('scheduler-root')
-            for side in ('start', 'end', 'top', 'bottom'):
-                getattr(root, f'set_margin_{side}')(6)
+            for side in ('start','end','top','bottom'):
+                getattr(root,'set_margin_'+side)(5)
             toolbar.set_content(root)
             win.set_content(toolbar)
+            root.append(self.status_line())
 
-            state = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=14)
-            state.add_css_class('scheduler-state')
-            self.state_box = state
-            self.target_label = Gtk.Label(label='Fenêtre : non vérifiée', xalign=0)
-            self.target_label.set_hexpand(True)
-            self.target_label.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
-            state.append(self.target_label)
-            self.next_label = Gtk.Label(label='Prochaine : Play', xalign=1)
-            self.next_label.set_hexpand(True)
-            self.next_label.set_ellipsize(Pango.EllipsizeMode.END)
-            self.next_label.add_css_class('scheduler-next')
-            state.append(self.next_label)
-            root.append(state)
+            actions=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=5)
+            root.append(actions)
+            self.button(actions,'previous','⏮',self.previous,'Parcourir l’historique sans réexécuter une action.')
+            self.button(actions,'play','▶ Play',self.play,'Démarrer ou reprendre la surveillance Codex existante.')
+            self.button(actions,'pause','⏸ Pause',self.pause,'Suspendre toute action automatique.')
+            self.button(actions,'stop','■ Stop',self.stop,'Arrêter la surveillance tout en conservant le scénario.')
+            self.button(actions,'next','⏭',self.next,'Afficher la prochaine action anticipée sans la déclencher.')
+            self.button(actions,'save','Enregistrer scénario',self.save_workflow,'Enregistrer le graphe localement dans le profil utilisateur.')
+            self.button(actions,'detect','Détecter Devin',self.detect,'Vérifier le projet cible puis restaurer fenêtre et souris.')
+            self.button(actions,'send','Envoyer maintenant',self.send,'Envoi manuel du prompt général configuré dans Préférences.')
+            force=self.button(actions,'force_test','⚡ Force test',self.force_test,
+                              'Envoie réellement le prompt du bloc Envoyer prompt sélectionné ; ignore uniquement les déclencheurs et la timeline, pas les protections X11/OCR/quota.')
+            force.add_css_class('suggested-action')
+            self.button(actions,'approve','Approuver',self.approve,'Autoriser l’envoi après une demande de validation locale.')
 
-            transports = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            transports.add_css_class('scheduler-controls')
-            root.append(transports)
-            self._button(transports, 'previous', '⏮ Précédente', self.previous,
-                         'Voir une action passée dans le journal. Ne la réexécute pas.')
-            self._button(transports, 'play', '▶ Play', self.play,
-                         'Démarrer ou reprendre le superviseur')
-            self._button(transports, 'pause', '⏸ Pause', self.pause,
-                         'Suspendre les actions automatiques en conservant le cycle en cours')
-            self._button(transports, 'stop', '■ Stop', self.stop,
-                         'Arrêter le superviseur, sans modifier les tâches sauvegardées')
-            self._button(transports, 'next', '⏭ Suivante (aperçu)', self.next,
-                         'Voir la prochaine action anticipée. Ne lance aucun prompt.')
+            # Two nested horizontal Paned widgets create three freely resizable
+            # upper panes. Vertical Paned guarantees timeline stays on the bottom.
+            vertical=Gtk.Paned(orientation=Gtk.Orientation.VERTICAL)
+            vertical.set_wide_handle(True)
+            vertical.set_resize_start_child(True)
+            vertical.set_shrink_start_child(True)
+            vertical.set_resize_end_child(True)
+            vertical.set_shrink_end_child(True)
+            vertical.set_vexpand(True)
+            root.append(vertical)
 
-            # Critical fix: a plain Grid forces the window's minimum height
-            # to include every control on the tallest column. A ScrolledWindow
-            # gives the single-page dashboard a bounded minimum instead.
-            # On a normal 1160x700 window, compact margins keep the settings
-            # visible together; on smaller screens only this area scrolls.
-            viewport = Gtk.ScrolledWindow()
-            viewport.add_css_class('scheduler-settings-viewport')
-            viewport.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
-            viewport.set_propagate_natural_height(False)
-            viewport.set_min_content_height(280)
-            viewport.set_vexpand(True)
-            viewport.set_hexpand(True)
-            root.append(viewport)
+            upper=Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+            upper.set_wide_handle(True)
+            upper.set_resize_start_child(False)
+            upper.set_resize_end_child(True)
+            upper.set_shrink_start_child(True)
+            upper.set_shrink_end_child(True)
+            vertical.set_start_child(upper)
+            upper.set_position(245)
+            upper.set_start_child(self.make_library())
 
-            columns = Gtk.Grid(column_spacing=8)
-            columns.set_column_homogeneous(True)
-            columns.set_hexpand(True)
-            viewport.set_child(columns)
-            left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-            right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
-            left.set_hexpand(True)
-            right.set_hexpand(True)
-            columns.attach(left, 0, 0, 1, 1)
-            columns.attach(right, 1, 0, 1, 1)
+            center_right=Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+            center_right.set_wide_handle(True)
+            center_right.set_resize_start_child(True)
+            center_right.set_resize_end_child(False)
+            center_right.set_shrink_start_child(True)
+            center_right.set_shrink_end_child(True)
+            upper.set_end_child(center_right)
+            center_right.set_position(max(480,self.cfg['window_width']-580))
+            center_right.set_start_child(self.make_canvas())
+            center_right.set_end_child(self.make_inspector())
 
-            frame, panel = self._section('Cible X11', 'Explorer et Codex doivent être visibles dans la même fenêtre')
-            left.append(frame)
-            self._field(panel, 'project', 'Projet cible')
-            self._field(panel, 'app_pattern', 'Fenêtre IDE')
-            self._field(panel, 'prompt', 'Prompt')
-            self._field(panel, 'mode', 'Fin de cycle', kind='mode')
+            vertical.set_end_child(self.make_timeline())
+            vertical.set_position(max(340,self.cfg['window_height']-310))
 
-            frame, panel = self._section('Planification')
-            left.append(frame)
-            enabled = self._field(panel, 'schedule_enabled', 'Envoi unique activé', 'switch')
-            date_entry = self._field(panel, 'scheduled_at', 'Date/heure locale')
-            date_entry.set_placeholder_text('AAAA-MM-JJ HH:MM')
-            date_entry.set_sensitive(enabled.get_active())
-            enabled.connect('notify::active',
-                            lambda *_: date_entry.set_sensitive(enabled.get_active()))
-
-            frame, panel = self._section('Historique · lecture seule')
-            frame.set_vexpand(True)
-            left.append(frame)
-            self.history_label = Gtk.Label(label='Prochaine action anticipée', xalign=0)
-            self.history_label.set_ellipsize(Pango.EllipsizeMode.END)
-            self.history_label.add_css_class('scheduler-event')
-            panel.append(self.history_label)
-            pane = Gtk.ScrolledWindow(vexpand=True)
-            pane.set_min_content_height(65)
-            self.logs = Gtk.TextView(editable=False, cursor_visible=False,
-                                     monospace=True, wrap_mode=Gtk.WrapMode.WORD_CHAR)
-            self.logs.add_css_class('scheduler-log')
-            pane.set_child(self.logs)
-            panel.append(pane)
-
-            frame, panel = self._section('Surveillance')
-            right.append(frame)
-            for key, title, low, high in [
-                ('poll_seconds', 'Intervalle OCR (s)', 5, 3600),
-                ('scroll_seconds', 'Défilement (s, 0=off)', 0, 3600),
-                ('scroll_steps', 'Crans de défilement', 1, 80),
-                ('max_cycles', 'Cycles maximum', 1, 100),
-                ('cooldown_seconds', 'Pause entre prompts (s)', 15, 3600),
-                ('idle_seconds', 'Inactivité avant action (s)', 0, 3600),
-            ]:
-                self._field(panel, key, title, 'spin', (low, high))
-
-            frame, panel = self._section('Notifications SMTP SSL',
-                                         'Secrets : AUTO_AI_SMTP_USER / AUTO_AI_SMTP_PASSWORD')
-            right.append(frame)
-            mail = self._field(panel, 'email_enabled', 'Activer les emails', 'switch')
-            self._field(panel, 'email_to', 'Destinataire')
-            self._field(panel, 'email_from', 'Expéditeur')
-            self._field(panel, 'smtp_host', 'Serveur SMTP')
-            self._field(panel, 'smtp_port', 'Port SSL', 'spin', (1, 65535))
-            self._field(panel, 'email_on_prompt', 'Email après envoi', 'switch')
-            self._field(panel, 'email_on_error', 'Email en cas d’erreur', 'switch')
-            mail_keys = ('email_to', 'email_from', 'smtp_host', 'smtp_port',
-                         'email_on_prompt', 'email_on_error')
-            for key in mail_keys:
-                self.fields[key].set_sensitive(mail.get_active())
-            mail.connect('notify::active', lambda *_: [
-                self.fields[key].set_sensitive(mail.get_active()) for key in mail_keys])
-
-            tools = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            tools.add_css_class('scheduler-tools')
-            root.append(tools)
-            self._button(tools, 'save', 'Enregistrer', self.save,
-                         'Enregistre tous les réglages sans démarrer la surveillance')
-            self._button(tools, 'detect', 'Tester la détection', self.detect,
-                         'Recherche une fenêtre de projet et restaure le focus/la souris')
-            self._button(tools, 'send', 'Envoyer maintenant', self.send,
-                         'Envoie explicitement le prompt dans la fenêtre vérifiée')
-            self._button(tools, 'approve', 'Approuver', self.approve,
-                         'Autoriser le prochain prompt après la demande de confirmation')
-            self.status = Gtk.Label(label='Inactif · appuyer sur Play', xalign=0)
+            self.status=Gtk.Label(label='Inactif · Play démarre le superviseur, pas le graphe.',xalign=0)
             self.status.set_ellipsize(Pango.EllipsizeMode.END)
-            self.status.add_css_class('scheduler-event')
+            self.status.set_tooltip_text('Le graphe se sauvegarde et se teste en mode non exécutable pour le moment.')
             root.append(self.status)
-            self._refresh()
-            self.timer = GLib.timeout_add_seconds(3, self._poll)
+            self.select_node(self.graph.nodes[0].id if self.graph.nodes else None)
+            self.refresh()
+            self.timer=GLib.timeout_add_seconds(3,self._poll)
             win.present()
 
-        def _refresh(self):
-            if self.state_box is None:
-                return
-            target = recent_target(self.engine)
-            if target is not None:
-                # The green state is tied to a recent verified OCR window, never
-                # to title matching alone or a stale identification.
-                self.state_box.add_css_class('found')
-                self.target_label.set_text(
-                    f'● Fenêtre trouvée : {target.title} · {self.cfg["project"]} · Codex {target.ui_state}')
-            else:
-                self.state_box.remove_css_class('found')
-                self.target_label.set_text('○ Fenêtre : non vérifiée ou détection expirée')
-            upcoming = next_action(self.engine, self.controls.phase)
-            self.next_label.set_text('Prochaine : ' + upcoming)
-            self.next_label.set_tooltip_text(upcoming)
-            selection = self.controls.history.selected()
-            self.history_label.set_text('Historique : ' + selection if selection else
-                                        'Action anticipée : ' + upcoming)
-            for key, active in {
-                'play': self.controls.phase != 'running',
-                'pause': self.controls.phase == 'running',
-                'stop': self.controls.phase != 'stopped',
-                'previous': self.controls.history.can_previous,
-                'next': self.controls.history.can_next,
-                'approve': self.engine.pending_approval,
-            }.items():
-                if key in self.buttons:
-                    self.buttons[key].set_sensitive(active)
+        def section_title(self,text,hint=''):
+            box=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=2)
+            title=Gtk.Label(label=text,xalign=0)
+            title.add_css_class('scheduler-title')
+            box.append(title)
+            if hint:
+                note=Gtk.Label(label=hint,xalign=0,wrap=True)
+                note.add_css_class('scheduler-hint')
+                note.set_tooltip_text(hint)
+                box.append(note)
+            return box
 
-        def save(self, *_):
-            try:
-                updated = dict(self.cfg)
-                switches = ('email_enabled', 'schedule_enabled',
-                            'email_on_prompt', 'email_on_error')
-                numeric = ('poll_seconds', 'scroll_seconds', 'scroll_steps',
-                           'max_cycles', 'cooldown_seconds', 'idle_seconds',
-                           'smtp_port')
-                for key, widget in self.fields.items():
-                    if key in switches:
-                        updated[key] = widget.get_active()
-                    elif key == 'mode':
-                        updated[key] = ['manual', 'auto', 'approval'][widget.get_selected()]
-                    elif key in numeric:
-                        updated[key] = widget.get_value_as_int()
-                    else:
-                        updated[key] = widget.get_text()
-                if updated['schedule_enabled'] and (
-                    not self.cfg['schedule_enabled'] or
-                    any(updated[key] != self.cfg[key] for key in
-                        ('scheduled_at', 'project', 'prompt'))
-                ):
-                    updated['schedule_id'] = uuid4().hex
-                # Validation occurs before modifying either configuration object.
-                config.save(updated)
-                self.cfg = updated
-                self.engine.config = updated
-                self.log('Configuration enregistrée')
-                return True
-            except Exception as exc:
-                self.log(f'Configuration invalide : {exc}')
+        def make_library(self):
+            wrap=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=7)
+            wrap.add_css_class('scheduler-panel')
+            wrap.set_size_request(190,-1)
+            wrap.append(self.section_title('Bibliothèque de blocs','Ajouter des étapes au scénario (sans exécution immédiate)'))
+            scroll=Gtk.ScrolledWindow()
+            scroll.set_vexpand(True)
+            wrap.append(scroll)
+            stack=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=6)
+            scroll.set_child(stack)
+            for category in ('Déclencheur','Condition','Action'):
+                frame=Gtk.Frame(label=category)
+                pack=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=4)
+                for side in ('start','end','top','bottom'):
+                    getattr(pack,'set_margin_'+side)(5)
+                frame.set_child(pack)
+                stack.append(frame)
+                for kind,(title,group,defaults,help_text) in NODE_KINDS.items():
+                    if category!=group:continue
+                    btn=Gtk.Button(label='+ '+title)
+                    btn.set_tooltip_text(help_text+'\nAjoute un bloc modifiable à l’éditeur central.')
+                    btn.connect('clicked',lambda _b,k=kind:self.add_node(k))
+                    pack.append(btn)
+            hint=Gtk.Label(label='Relier : cliquez le port vert, puis le port gauche. Glisser : déplacer un bloc.',wrap=True,xalign=0)
+            hint.set_tooltip_text('Les liens sont orientés et les cycles sont interdits.')
+            stack.append(hint)
+            return wrap
+
+        def make_canvas(self):
+            wrap=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=3)
+            wrap.append(self.section_title('Éditeur visuel','Glisser les blocs ; relier les ports ; sélectionner pour modifier à droite'))
+            viewport=Gtk.ScrolledWindow()
+            viewport.set_hexpand(True)
+            viewport.set_vexpand(True)
+            viewport.set_policy(Gtk.PolicyType.AUTOMATIC,Gtk.PolicyType.AUTOMATIC)
+            self.canvas=editor.canvas_widget(Gtk,self.graph,self.select_node,
+                                             self.graph_changed,self.log,self.cfg['font_size'])
+            viewport.set_child(self.canvas)
+            wrap.append(viewport)
+            return wrap
+
+        def make_inspector(self):
+            wrap=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=5)
+            wrap.add_css_class('scheduler-panel')
+            wrap.set_size_request(225,-1)
+            wrap.append(self.section_title('Propriétés & OCR','Sélectionnez un bloc dans le graphe ou la timeline'))
+            self.inspector=Gtk.ScrolledWindow()
+            self.inspector.set_vexpand(True)
+            wrap.append(self.inspector)
+            return wrap
+
+        def make_timeline(self):
+            lower=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=4)
+            lower.add_css_class('scheduler-timeline')
+            timeline,reload=self._timeline_components()
+            self.timeline_reload=reload
+            timeline.set_vexpand(True)
+            lower.append(timeline)
+            bottom=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=5)
+            lower.append(bottom)
+            lbl=Gtk.Label(label='Journal',xalign=0)
+            lbl.set_tooltip_text('Liste locale des événements, sans enregistrement de screenshots.')
+            bottom.append(lbl)
+            logscroll=Gtk.ScrolledWindow()
+            logscroll.set_min_content_height(45)
+            logscroll.set_size_request(-1,53)
+            logscroll.set_hexpand(True)
+            self.log_widget=Gtk.TextView(editable=False,cursor_visible=False,monospace=True)
+            self.log_widget.add_css_class('scheduler-small')
+            logscroll.set_child(self.log_widget)
+            bottom.append(logscroll)
+            return lower
+
+        def _timeline_components(self):
+            return editor.timeline_widget(Gtk,self.graph,self.proof_store,self.select_node)
+
+        def graph_changed(self):
+            self.workflow_store.save(self.graph)
+            if self.canvas:self.canvas.queue_draw()
+            if self.timeline_reload:self.timeline_reload()
+
+        def add_node(self,kind):
+            count=len(self.graph.nodes)
+            node=self.graph.add(kind,100+(count%4)*260,80+(count//4)*125)
+            self.graph_changed()
+            self.select_node(node.id)
+            self.log('Bloc ajouté : '+node.label)
+
+        def select_node(self,ident):
+            self.selected=ident
+            self.update_inspector()
+            if self.canvas:self.canvas.queue_draw()
+
+        def update_inspector(self):
+            if self.inspector is None:return
+            node=self.graph.find(self.selected)
+            panel=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=8)
+            for side in ('start','end','top','bottom'):
+                getattr(panel,'set_margin_'+side)(7)
+            if node is None:
+                panel.append(Gtk.Label(label='Aucun bloc sélectionné.\nAjoutez-en un depuis la bibliothèque.',wrap=True))
+                self.inspector.set_child(panel)
+                return
+            label=Gtk.Label(label=f'{node.label} · {NODE_KINDS[node.kind][1]}',xalign=0)
+            label.add_css_class('scheduler-title')
+            panel.append(label)
+            desc=Gtk.Label(label=NODE_KINDS[node.kind][3],wrap=True,xalign=0)
+            desc.set_tooltip_text(NODE_KINDS[node.kind][3])
+            panel.append(desc)
+            for key,value in node.params.items():
+                row=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=2)
+                title=Gtk.Label(label=key,xalign=0)
+                title.set_tooltip_text('Paramètre du bloc ; sauvegardé localement, jamais envoyé automatiquement.')
+                row.append(title)
+                entry=Gtk.Entry(text=value)
+                entry.set_tooltip_text('Entrée texte. Pour une preuve OCR, utilisez expected et roi (x,y,w,h en %).')
+                entry.connect('changed',lambda widget,k=key,n=node:self.param_changed(n,k,widget.get_text()))
+                row.append(entry)
+                panel.append(row)
+            if node.kind=='ocr':
+                self._ocr_editor(panel,node)
+            remove=Gtk.Button(label='Supprimer ce bloc')
+            remove.set_tooltip_text('Supprime le bloc et ses connexions de ce scénario local.')
+            remove.connect('clicked',lambda *_:self.remove_node(node.id))
+            panel.append(remove)
+            self.inspector.set_child(panel)
+
+        def _ocr_editor(self,panel,node):
+            photo=Gtk.Button(label='Importer une capture de référence')
+            photo.set_tooltip_text('Image locale, stockée uniquement sous ~/.local/share/auto-ai-scheduler/proofs (permissions 0600).')
+            photo.connect('clicked',lambda *_:self.select_proof_file(node))
+            panel.append(photo)
+            if node.params.get('proof_id'):
+                try:
+                    path=self.proof_store._file(node.params['proof_id'])
+                    if path.exists():
+                        pic=Gtk.Picture.new_for_filename(str(path))
+                        pic.set_content_fit(Gtk.ContentFit.CONTAIN)
+                        pic.set_size_request(-1,110)
+                        panel.append(pic)
+                except ValueError:pass
+            check=Gtk.Button(label='Tester la preuve OCR')
+            check.set_tooltip_text('Teste la référence enregistrée, sans interaction avec Devin.')
+            check.connect('clicked',lambda *_:self.test_proof(node))
+            panel.append(check)
+            live=Gtk.Button(label='Comparer avec Devin (manuel)')
+            live.set_tooltip_text('Lit la fenêtre Devin confirmée par OCR, restaure focus et souris, sans envoyer de prompt.')
+            live.connect('clicked',lambda *_:self.test_proof(node,live=True))
+            panel.append(live)
+
+        def select_proof_file(self,node):
+            dialog=Gtk.FileDialog(title='Sélectionner une preuve OCR locale')
+            def done(d,result):
+                try:
+                    chosen=d.open_finish(result)
+                    if not chosen:return
+                    proof_id=self.proof_store.import_image(chosen.get_path())
+                    spec,actual=self.proof_store.generate_test(proof_id,node.params.get('expected',''))
+                    node.params['proof_id']=proof_id
+                    node.params['expected']=spec.expected
+                    node.params['roi']=spec.roi
+                    self.graph_changed()
+                    self.select_node(node.id)
+                    self.log('Test OCR généré dans les données locales (preuve non publiée).')
+                except Exception as exc:
+                    self.log('Import OCR : '+str(exc))
+            dialog.open(self.window,None,done)
+
+        def param_changed(self,node,key,value):
+            node.params[key]=value
+            if self._save_timeout is not None:
+                GLib.source_remove(self._save_timeout)
+            def flush():
+                self._save_timeout=None
+                self.graph_changed()
                 return False
+            self._save_timeout=GLib.timeout_add(450,flush)
 
-        def detect(self, *_):
-            if not self.save():
+        def remove_node(self,ident):
+            self.graph.delete(ident)
+            self.graph_changed()
+            self.select_node(None)
+            self.log('Bloc supprimé du scénario local')
+
+        def test_proof(self,node,live=False):
+            if not node.params.get('proof_id'):
+                self.log('Importez d’abord une preuve OCR.')
                 return
-            obs = self.engine.inspect_target()
-            if obs is None:
-                self.log('Aucune fenêtre Devin+Codex avec le projet cible')
-            else:
-                self.log(f'Projet trouvé · Codex : {obs.state} · champ : {obs.composer}')
+            try:
+                if live:
+                    result={'matched':False,'seen':False}
+                    def action(wid,obs,offset):
+                        screenshot,_=x11.screenshot(wid)
+                        result['matched'],actual=self.proof_store.test(node.params['proof_id'],screenshot)
+                        result['seen']=True
+                    self.engine.inspect_target(action)
+                    if not result['seen']:
+                        self.log('Preuve OCR : fenêtre Devin/projet non identifié(e)')
+                    else:
+                        self.log('OCR actuel : '+('détecté' if result['matched'] else 'absent'))
+                else:
+                    matched,actual=self.proof_store.test(node.params['proof_id'])
+                    self.log('Test de référence OCR : '+('réussi' if matched else 'échec'))
+            except Exception as exc:
+                self.log('Test OCR : '+str(exc))
 
-        def send(self, *_):
-            if self.save():
-                if not self.engine.send('manual'):
-                    self.log('Envoi manuel refusé : vérifiez l’état Codex et les limites')
+        def save_workflow(self,*_):
+            self.graph_changed()
+            self.log('Scénario sauvegardé localement (non exécuté).')
 
-        def play(self, *_):
-            if self.save() and self.controls.play():
-                self.log('Play · surveillance démarrée / reprise')
+        def open_preferences(self,*_):
+            if self.display_settings is not None:
+                self.display_settings.present()
+                return
+            win=Gtk.Window(title='Préférences · Auto AI Scheduler',transient_for=self.window)
+            self.display_settings=win
+            win.set_default_size(950,730)
+            win.connect('close-request',lambda *_:self._settings_closed())
+            scroll=Gtk.ScrolledWindow()
+            scroll.set_policy(Gtk.PolicyType.NEVER,Gtk.PolicyType.AUTOMATIC)
+            win.set_child(scroll)
+            parent=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=8)
+            for side in ('start','end','top','bottom'):
+                getattr(parent,'set_margin_'+side)(12)
+            scroll.set_child(parent)
+            parent.append(self.section_title('Préférences de l’application','Paramètres du superviseur et de la fenêtre graphique'))
+            grid=Gtk.Grid(column_spacing=12,row_spacing=6)
+            grid.set_column_homogeneous(True)
+            parent.append(grid)
+            fields={}
+            groups=[
+                ('Affichage', [('window_width','Largeur initiale','spin',960,3840),('window_height','Hauteur initiale','spin',600,2160),
+                               ('font_size','Police (px)','spin',10,20),('theme','Thème','theme',0,0)]),
+                ('Devin et planification', [('project','Projet cible','text',0,0),('app_pattern','Fenêtre IDE','text',0,0),
+                                            ('prompt','Prompt Codex','text',0,0),('mode','Après cycle','mode',0,0),
+                                            ('schedule_enabled','Horaire activé','switch',0,0),('scheduled_at','Date/heure locale','text',0,0)]),
+                ('Surveillance', [('poll_seconds','OCR toutes les (s)','spin',5,3600),
+                                   ('scroll_seconds','Scroll toutes les (s)','spin',0,3600),
+                                   ('scroll_steps','Crans','spin',1,80),('max_cycles','Cycles max','spin',1,100),
+                                   ('cooldown_seconds','Cooldown (s)','spin',15,3600),
+                                   ('idle_seconds','Inactivité requise (s)','spin',0,3600)]),
+                ('Email', [('email_enabled','Activer SMTP','switch',0,0),('email_to','Destinataire','text',0,0),
+                            ('email_from','Expéditeur','text',0,0),('smtp_host','Serveur SMTP','text',0,0),
+                            ('smtp_port','Port SSL','spin',1,65535),
+                            ('email_on_prompt','Notifier les prompts','switch',0,0),
+                            ('email_on_error','Notifier les erreurs','switch',0,0)]),
+            ]
+            for index,(name,items) in enumerate(groups):
+                frame=Gtk.Frame(label=name)
+                inner=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=6)
+                for side in ('start','end','top','bottom'):
+                    getattr(inner,'set_margin_'+side)(9)
+                frame.set_child(inner)
+                grid.attach(frame,index%2,index//2,1,1)
+                for key,title,kind,low,high in items:
+                    row=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=6)
+                    caption=Gtk.Label(label=title,xalign=0)
+                    caption.set_hexpand(True)
+                    caption.set_tooltip_text(HELP[key])
+                    row.append(caption)
+                    if kind=='spin':
+                        widget=Gtk.SpinButton.new_with_range(low,high,1)
+                        widget.set_value(self.cfg[key])
+                    elif kind=='switch':
+                        widget=Gtk.Switch()
+                        widget.set_active(bool(self.cfg[key]))
+                        widget.set_valign(Gtk.Align.CENTER)
+                    elif kind=='mode':
+                        widget=Gtk.DropDown.new_from_strings(['Manuel','Automatique','Confirmation'])
+                        widget.set_selected(['manual','auto','approval'].index(self.cfg[key]))
+                    elif kind=='theme':
+                        widget=Gtk.DropDown.new_from_strings(['Système','Sombre','Clair'])
+                        widget.set_selected(['system','dark','light'].index(self.cfg[key]))
+                    else:
+                        widget=Gtk.Entry(text=str(self.cfg[key]))
+                        widget.set_width_chars(15)
+                    widget.set_tooltip_text(HELP[key])
+                    fields[key]=widget
+                    row.append(widget)
+                    inner.append(row)
+            savebtn=Gtk.Button(label='Enregistrer et appliquer les préférences')
+            savebtn.set_tooltip_text('Enregistre tous les paramètres et redimensionne la fenêtre ; les titres suivent la taille du texte.')
+            def save_prefs(_button):
+                proposed=dict(self.cfg)
+                for key,w in fields.items():
+                    if key in ('email_enabled','schedule_enabled','email_on_prompt','email_on_error'):
+                        proposed[key]=w.get_active()
+                    elif key in ('mode','theme'):
+                        choices=['manual','auto','approval'] if key=='mode' else ['system','dark','light']
+                        proposed[key]=choices[w.get_selected()]
+                    elif key in ('window_width','window_height','font_size','poll_seconds','scroll_seconds',
+                                 'scroll_steps','max_cycles','cooldown_seconds','idle_seconds','smtp_port'):
+                        proposed[key]=w.get_value_as_int()
+                    else:proposed[key]=w.get_text()
+                try:
+                    proposed=config.validate(proposed)
+                    if proposed['schedule_enabled'] and (
+                        not self.cfg['schedule_enabled'] or
+                        any(proposed[k]!=self.cfg[k] for k in ('scheduled_at','project','prompt'))):
+                        proposed['schedule_id']=uuid4().hex
+                    config.save(proposed)
+                    self.cfg=proposed
+                    self.engine.config=proposed
+                    self.css_apply()
+                    self.window.set_default_size(proposed['window_width'],proposed['window_height'])
+                    self.window.set_size_request(920,560)
+                    # GTK4 resize() is not available on ApplicationWindow.
+                    self.log('Préférences enregistrées · nouvelle géométrie au prochain lancement')
+                except Exception as exc:
+                    self.log('Paramètres invalides : '+str(exc))
+            savebtn.connect('clicked',save_prefs)
+            parent.append(savebtn)
+            win.present()
 
-        def pause(self, *_):
-            if self.controls.pause():
-                self.log('Pause · aucune action automatique')
+        def _settings_closed(self):
+            self.display_settings=None
+            return False
 
-        def stop(self, *_):
-            if self.controls.stop():
-                self.log('Stop · surveillance désactivée ; programmation conservée')
+        def detect(self,*_):
+            obs=self.engine.inspect_target()
+            if obs is None:self.log('Devin/Codex avec projet cible introuvable')
+            else:self.log(f'Projet confirmé · Codex {obs.state}')
 
-        def previous(self, *_):
+        def send(self,*_):
+            if not self.engine.send('manual'):
+                self.log('Envoi manuel refusé (état, quota, projet ou cooldown)')
+
+        def force_test(self,*_):
+            node = planned_send(self.graph, self.selected)
+            if node is None:
+                self.log('Force test : ajoutez un bloc « Envoyer prompt » au scénario')
+                return
+            prompt = node.params.get('prompt', '')
+            if not prompt.strip():
+                self.log('Force test : le prompt du bloc est vide')
+                return
+            # Confirmation displays the exact prompt and its source; the
+            # graph and timeline are not moved on either branch.
+            dialog = Adw.MessageDialog.new(self.window,
+                        'Force test · envoi réel dans Codex',
+                        'Bloc : ' + node.label + '\n\nPrompt à envoyer :\n' + prompt +
+                        '\n\nAucun déclencheur du graphe ne sera exécuté et ' +
+                        'la timeline ne changera pas. La programmation reste active.')
+            dialog.add_response('cancel', 'Annuler')
+            dialog.add_response('send', 'Envoyer ce prompt')
+            dialog.set_response_appearance('send', Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.set_default_response('cancel')
+            dialog.set_close_response('cancel')
+            def chosen(_dialog, response):
+                if response != 'send':
+                    return
+                if not self.engine.force_test(prompt):
+                    self.log('Force test refusé : contrôle projet/Codex, quota, travail actif ou cooldown')
+                else:
+                    self.log('Force test exécuté depuis le bloc ' + node.id + ' · timeline inchangée')
+            dialog.connect('response', chosen)
+            dialog.present()
+
+        def play(self,*_):
+            if self.controls.play():self.log('Surveillance Codex démarrée · graphe en édition uniquement')
+
+        def pause(self,*_):
+            if self.controls.pause():self.log('Pause du superviseur')
+
+        def stop(self,*_):
+            if self.controls.stop():self.log('Superviseur arrêté')
+
+        def previous(self,*_):
             self.controls.history.previous()
-            self._refresh()
+            self.refresh()
 
-        def next(self, *_):
+        def next(self,*_):
             self.controls.history.next()
-            self._refresh()
+            self.refresh()
 
-        def approve(self, *_):
-            if self.save() and self.engine.pending_approval:
+        def approve(self,*_):
+            if self.engine.pending_approval:
                 self.engine.approve()
-                self.log('Approbation demandée pour la prochaine action')
+                self.log('Approbation locale demandée')
+
+        def refresh(self):
+            if self.status_box is None:return
+            target=recent_target(self.engine)
+            if target is not None:
+                self.status_box.add_css_class('found')
+                self.target_label.set_text(f'● Devin {target.title}  ·  {self.cfg["project"]}  ·  {target.ui_state}')
+            else:
+                self.status_box.remove_css_class('found')
+                self.target_label.set_text('○ Fenêtre non encore vérifiée / OCR expiré')
+            upcoming=next_action(self.engine,self.controls.phase)
+            self.next_label.set_text('Prochaine : '+upcoming)
+            self.next_label.set_tooltip_text(upcoming)
+            if 'force_test' in self.buttons:
+                self.buttons['force_test'].set_sensitive(
+                    planned_send(self.graph, self.selected) is not None)
+            for key,allow in {'play':self.controls.phase!='running',
+                              'pause':self.controls.phase=='running',
+                              'stop':self.controls.phase!='stopped',
+                              'previous':self.controls.history.can_previous,
+                              'next':self.controls.history.can_next,
+                              'approve':self.engine.pending_approval}.items():
+                if key in self.buttons:self.buttons[key].set_sensitive(allow)
 
         def _poll(self):
             try:
-                if self.controls.phase == 'running':
+                if self.controls.phase=='running':
                     self.engine.tick()
-                    # The engine may disable itself on errors.
-                    if not self.engine.enabled:
-                        self.controls.phase = 'stopped'
-                if self.fields['schedule_enabled'].get_active() != self.cfg['schedule_enabled']:
-                    self.fields['schedule_enabled'].set_active(self.cfg['schedule_enabled'])
-            except Exception as exc:
-                self.log('Surveillance : ' + str(exc))
-            self._refresh()
+                    if not self.engine.enabled:self.controls.phase='stopped'
+            except Exception as exc:self.log('Surveillance : '+str(exc))
+            self.refresh()
             return True
 
     App().run(None)

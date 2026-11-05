@@ -1,6 +1,7 @@
 """Small, validated, user-local configuration."""
 import json
 from .schedule import parse_local
+from .display import DEFAULTS as DISPLAY_DEFAULTS, validate as validate_display
 from pathlib import Path
 
 CONFIG = Path.home() / '.config' / 'auto-ai-scheduler' / 'settings.json'
@@ -13,6 +14,7 @@ DEFAULTS = {
     'email_enabled': False, 'email_on_prompt': True, 'email_on_error': True,
     'schedule_enabled': False, 'scheduled_at': '', 'schedule_id': '',
     'idle_seconds': 8,
+    **DISPLAY_DEFAULTS,
 }
 
 
@@ -29,6 +31,7 @@ def validate(cfg):
         cfg[k] = int(cfg[k])
         if not low <= cfg[k] <= high:
             raise ValueError(f'Invalid {k}')
+    cfg.update(validate_display({k: cfg[k] for k in DISPLAY_DEFAULTS}))
     if cfg['schedule_enabled']:
         parse_local(cfg['scheduled_at'])
     return cfg

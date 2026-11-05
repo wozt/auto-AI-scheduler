@@ -43,6 +43,9 @@ class Scheduler:
         self._last_idle_warning = 0.0
         self.last_target = None
         self.last_ui_state = 'UNKNOWN'
+        self.force_test_pending = False
+        self.force_test_marker = ''
+        self.force_test_at = 0.0
 
     def _notify(self, subject, body):
         c = self.config
@@ -99,6 +102,9 @@ class Scheduler:
 
     def send(self, reason='manual'):
         """Single verified send, never from a stale or unrecognized chat."""
+        if self.force_test_pending:
+            self.log('Force test in progress: regular send blocked')
+            return False
         if self.session.cycles >= self.config['max_cycles']:
             self.log('Cycle limit reached')
             return False
@@ -134,6 +140,50 @@ class Scheduler:
                 self._notify('Prompt sent', f'Project: {self.config["project"]}\nCycle: {self.session.cycles}')
         return success
 
+    def force_test(self, prompt):
+        """Send exactly one explicit test prompt to a freshly verified composer.
+
+        Bypasses workflow event/date triggers, never increments cycle counts,
+        consumes no scheduled-job claim, and never advances the visual timeline.
+        Quota, UI state, active cycle and cooldown protections remain enforced.
+        """
+        if not isinstance(prompt, str) or not prompt.strip() or '\n' in prompt or len(prompt) > 4000:
+            self.log('Force test rejected: invalid prompt')
+            return False
+        if self.session.waiting_for_response:
+            self.log('Force test rejected: supervisor cycle still in progress')
+            return False
+        if self.force_test_pending and self.enabled:
+            self.log('Force test rejected: previous test awaiting completion')
+            return False
+        if time.monotonic() - self.session.last_sent < self.config['cooldown_seconds']:
+            self.log('Force test rejected: cooldown')
+            return False
+
+        success = False
+        def perform(wid, obs, offset):
+            nonlocal success
+            if obs.state not in ('READY', 'FINISHED') or obs.composer is None:
+                self.log(f'Force test rejected: Codex state {obs.state}')
+                return
+            xy = (offset[0] + obs.composer[0], offset[1] + obs.composer[1])
+            x11.type_and_send(wid, xy, prompt)
+            self.session.last_sent = time.monotonic()
+            self.session.stable = 0
+            self.session.previous = ''
+            self.force_test_pending = True
+            self.force_test_at = self.session.last_sent
+            self.force_test_marker = obs.cycle_marker
+            success = True
+
+        self.inspect_target(perform)
+        if success:
+            self.log('Force test prompt sent; visual timeline and scheduled job unchanged')
+            if self.config.get('email_on_prompt'):
+                self._notify('Force test prompt sent',
+                             f'Project: {self.config["project"]}\nThis was an isolated test, not a scheduled cycle.')
+        return success
+
     def scroll(self):
         did_scroll = False
         def perform(wid,obs,offset):
@@ -157,6 +207,35 @@ class Scheduler:
             if now - self._last_idle_warning > 60:
                 self.log(f'Idle safety unavailable; monitor paused: {exc}')
                 self._last_idle_warning = now
+            return
+
+        # An explicitly forced test never runs the scheduler chain while
+        # its response is pending. We observe completion without advancing a
+        # workflow node, consuming a scheduled claim, or sending a follow-up.
+        if self.force_test_pending:
+            if now - self._last_poll < self.config['poll_seconds']:
+                return
+            self._last_poll = now
+            obs = self.inspect_target()
+            if obs is None:
+                return
+            fingerprint = hashlib.sha256(
+                (obs.cycle_marker + '\n' + obs.text[-1200:]).encode()
+            ).hexdigest()
+            self.session.stable = (self.session.stable + 1
+                                   if self.session.previous == fingerprint else 1)
+            self.session.previous = fingerprint
+            if obs.state in ('ERROR', 'QUOTA'):
+                self.log(f'Force test stopped: Codex state {obs.state}')
+                self.force_test_pending = False
+                if obs.state == 'ERROR':
+                    self.enabled = False
+                return
+            if (obs.state == 'FINISHED' and self.session.stable >= 2
+                    and obs.cycle_marker != self.force_test_marker
+                    and now - self.force_test_at >= 25):
+                self.force_test_pending = False
+                self.log('Force test completed; timeline and schedule unchanged')
             return
 
         # A scheduled message is an explicit user request and does not require

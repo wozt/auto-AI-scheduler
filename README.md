@@ -159,3 +159,54 @@ This patch does not modify the Codex automation engine, time scheduling, or
 any private OCR reference. For users with large fonts/display scaling, the
 settings may require vertical scrolling; Gtk must never truncate buttons or
 warn about an impossible minimum window height.
+
+## Visual workflow editor and bottom timeline (patch 0006)
+
+- **Launch:** `./start.sh` uses the local `.venv` when available.
+- **Preferences:** change the default 1540×900 size, base font size (10–20px),
+  Adwaita theme, project, OCR intervals, scheduling and SMTP in a separate window.
+  Headings automatically stay 3px larger than the base font.
+- **Layout:** nested `Gtk.Paned` handles let you resize the node library,
+  graph canvas and inspector, plus the **full-width timeline anchored at the bottom**.
+  Shrinking the window produces independent scrollable panes.
+- **Nodes:** clock, delay, event, OCR proof, Codex state, send, scroll, notify
+  and wait. Select, drag, edit properties, remove and connect output→input.
+  Cyclic graph connections are refused.
+- **Timeline:** ordered step clips show their label, parameters and (when a
+  reference is attached) a small image thumbnail.
+- **Proofs:** import an image from disk, automatically generate a local OCR
+  test and optionally compare against the currently verified Devin window.
+  The image and its text matching specification are stored under
+  `~/.local/share/auto-ai-scheduler/proofs/` with restrictive permissions.
+  Nothing is uploaded, emailed or committed automatically.
+- **Persistence:** workflows live in the user's private data directory. No
+  workflow JSON or screenshots are added to the repository.
+
+**Important safety boundary:** This patch implements the visual scenario
+**editor, preview and manual OCR tests**. It does not yet execute graph nodes
+or convert them into automatic keyboard actions. Play/Pause/Stop still control
+only the existing guarded Codex supervisor. A later runner must require
+explicit opt-in, fresh OCR proof, verified project and quotas before it can
+execute an action sequence.
+
+### GTK settings warnings
+
+`Unknown key gtk-modules` and `gtk-application-prefer-dark-theme is unsupported`
+originate from the user's GTK4 settings, not the application window dimensions.
+To remove only those obsolete GTK4 keys and back up the original configuration,
+run **once**, if desired: `./start.sh --fix-gtk-config`.
+The application itself uses `Adw.StyleManager` for its light/dark preference.
+
+### Force test (explicit real Codex send)
+
+Click **⚡ Force test** to preview and confirm the exact prompt of the selected
+**Envoyer prompt** graph node; otherwise it previews the first send node in
+timeline order. It invokes the verified-project/composer X11 sending pipeline
+**once**, even if the graph's clock or OCR triggers have not fired. Quota,
+error, busy conversation and cooldown checks are not bypassed. It changes
+neither the visual node selection, the timeline, the scheduled-job claim nor
+the normal cycle counter. While the forced prompt is in progress, the automatic
+scheduler does not send anything; it resumes its normal behavior after the
+response is observed completed. Since the scheduled job is *not consumed*,
+that job may still run later at its configured time. A forced test is not a
+visual workflow runner.
