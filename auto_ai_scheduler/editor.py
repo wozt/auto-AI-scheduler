@@ -149,7 +149,7 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12):
     return area
 
 
-def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None, trace=None):
+def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None, trace=None, breakpoints=None):
     """Resizable bottom timeline: each ordered node is a time-track clip.
 
     Proof images only load from the user's private, local store.
@@ -208,7 +208,11 @@ def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None, trace=No
             content=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=5)
             for margin in ('start','end','top','bottom'):
                 getattr(content,'set_margin_'+margin)(6)
-            tip=Gtk.Label(label=f'{index+1:02d}  {node.label}',xalign=0)
+            is_breakpoint=breakpoints is not None and node.id in breakpoints()
+            tip=Gtk.Label(label=('● ' if is_breakpoint else '')+f'{index+1:02d}  {node.label}',xalign=0)
+            if is_breakpoint:
+                tip.add_css_class('scheduler-breakpoint')
+                frame.set_tooltip_text('● Point d’arrêt : l’exécution s’arrête avant ce bloc en mode débogage')
             tip.add_css_class('scheduler-small')
             content.append(tip)
             if node.kind=='ocr' and node.params.get('proof_id'):

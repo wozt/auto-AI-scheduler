@@ -25,6 +25,7 @@ def css(font_size):
             '.scheduler-panel {padding:6px;} '
             '.scheduler-timeline {background:alpha(@window_fg_color,.027);}'
             '.scheduler-clip-active {outline:2px solid #50c983;outline-offset:-2px;}'
+            '.scheduler-breakpoint {color:#e66b60;font-weight:700;}'
             '.scheduler-trace-done {border:1px solid #42a576;}'
             '.scheduler-trace-ocr_yes {border:1px solid #d7b34b;}'
             '.scheduler-trace-ocr_no {border:1px solid #ab8156;}'

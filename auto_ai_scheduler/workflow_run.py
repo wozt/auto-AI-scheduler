@@ -282,6 +282,66 @@ class WorkflowRunner:
         self.workflow_digest = None
         self.recovered = False
         self.trace = TraceJournal(self.monotonic)
+        # Opt-in debugger. These fields never alter workflow contents/checkpoints.
+        self.debug_enabled = False
+        self.debug_step_mode = False
+        self.debug_breakpoints = set()
+        self.debug_release = None
+        self.debug_hold = False
+
+    def configure_debug(self, enabled, breakpoints=()):
+        """Set debug policy only when disarmed; no implicit IDE action."""
+        if self.phase not in ('stopped', 'done', 'error'):
+            raise ValueError('Arrêtez le scénario avant de changer de mode debug')
+        self.debug_enabled = bool(enabled)
+        self.debug_step_mode = bool(enabled)
+        self.debug_breakpoints = {item for item in breakpoints if isinstance(item, str)}
+        self.debug_release = None
+        self.debug_hold = False
+
+    def set_breakpoints(self, breakpoints):
+        self.debug_breakpoints = {item for item in breakpoints if isinstance(item, str)}
+
+    def _debug_pause(self, detail):
+        self.debug_hold = True
+        self.debug_release = None
+        self.pause(detail)
+
+    def debug_step(self, *, send_confirmed=False):
+        """Allow exactly ONE node to finish, even if it needs several OCR polls.
+
+        A Send node requires an additional affirmative, exact-prompt GUI dialog;
+        this method never bypasses Scheduler's normal send safeguards.
+        """
+        if not self.debug_enabled or self.phase != 'paused' or self.current is None:
+            raise ValueError('Le pas-à-pas exige un scénario en pause et le mode debug')
+        if self.current.kind == 'send' and not send_confirmed:
+            raise ValueError('Confirmation explicite requise avant le prompt réel')
+        self.debug_step_mode = True
+        self.debug_release = self.current.id
+        try:
+            ok = self.resume()
+        except Exception:
+            self.debug_release = None
+            raise
+        self.debug_hold = False
+        return ok
+
+    def debug_continue(self, *, send_confirmed=False):
+        """Run until the next breakpoint, preserving normal send safeguards."""
+        if not self.debug_enabled or self.phase != 'paused' or self.current is None:
+            raise ValueError('Reprise debug possible uniquement depuis une pause')
+        if self.current.kind == 'send' and not send_confirmed:
+            raise ValueError('Confirmation explicite requise avant le prompt réel')
+        self.debug_step_mode = False
+        self.debug_release = self.current.id
+        try:
+            ok = self.resume()
+        except Exception:
+            self.debug_release = None
+            raise
+        self.debug_hold = False
+        return ok
 
     def _checkpoint(self):
         if self.checkpoints is None or self.workflow_digest is None:
@@ -344,6 +404,8 @@ class WorkflowRunner:
         self.sent_at = 0.0
         self.sent_marker = ''
         self.recovered = True
+        self.debug_release = None
+        self.debug_hold = self.debug_enabled
         self.phase = 'paused'
         self.last_reason = ('ENVOI INCERTAIN : vérifiez Codex. Stop puis réarmement explicite requis.'
                             if self.send_attempted else
@@ -406,6 +468,10 @@ class WorkflowRunner:
             raise
         self.trace.reset()
         self.trace.enter(self.current)
+        self.debug_release = None
+        self.debug_hold = False
+        if self.debug_enabled:
+            self._debug_pause('Débogage : premier bloc en pause · Pas ou Continuer')
         self.log(f'Scénario armé : {len(path)} blocs · aucune action sans vérification')
 
     def pause(self, reason='Pause demandée'):
@@ -418,9 +484,10 @@ class WorkflowRunner:
                         'send_unconfirmed' if reason.startswith('Envoi non confirmé') else
                         'idle_unavailable' if reason.startswith('Détection d’inactivité') else
                         'approval' if reason.startswith('Approbation') else
+                        'debug_breakpoint' if reason.startswith('Débogage :') else
                         'manual_pause' if reason == 'Pause demandée' else 'safety_block')
                 self.trace.record(self.current, 'timeout' if code == 'timeout' else
-                                  'paused' if code == 'manual_pause' else 'blocked', code)
+                                  'paused' if code in ('manual_pause', 'debug_breakpoint') else 'blocked', code)
             self._checkpoint()
             self.log(reason)
             return True
@@ -433,6 +500,8 @@ class WorkflowRunner:
             raise ValueError('Envoi incertain après redémarrage : vérifiez Codex, puis Stop ou Effacer reprise')
         if self.send_attempted and not self.waiting_response:
             raise ValueError('Envoi incertain : Stop puis vérifiez Codex avant de réarmer le scénario')
+        if self.debug_enabled and self.debug_hold and self.debug_release != (self.current.id if self.current else None):
+            raise ValueError('Débogueur en pause : utilisez Pas ou Continuer')
         self.phase = 'approval' if (self.current is not None and self.current.kind == 'send'
                                     and self.engine.config['mode'] == 'approval' and not self.approved) else 'running'
         # Time passed while the app was closed is NOT credited to a delay.
@@ -497,6 +566,7 @@ class WorkflowRunner:
         self.saw_running = False
         self.approved = False
         self.send_attempted = False
+        self.debug_release = None
         if self.current is None:
             self.phase = 'done'
             if self.checkpoints is not None:
@@ -506,6 +576,8 @@ class WorkflowRunner:
             self._checkpoint()
             self.trace.enter(self.current, at=now)
             self.log(f'Bloc {old.label} terminé → {self.current.label}')
+            if self.debug_enabled and (self.debug_step_mode or self.current.id in self.debug_breakpoints):
+                self._debug_pause('Débogage : arrêt avant ' + self.current.label)
 
     def _confirmed(self, identifier):
         if identifier is None:
@@ -639,6 +711,12 @@ class WorkflowRunner:
 
     def tick(self):
         if self.phase != 'running':
+            return
+        # A breakpoint is checked BEFORE any X11 operation or even an idle read.
+        if (self.debug_enabled and not self.waiting_response and self.current is not None
+                and self.debug_release != self.current.id
+                and (self.debug_step_mode or self.current.id in self.debug_breakpoints)):
+            self._debug_pause('Débogage : arrêt avant ' + self.current.label)
             return
         # Fail closed: never move windows if the user is actively using them.
         try:

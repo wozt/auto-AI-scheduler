@@ -351,3 +351,32 @@ existing X11, quota, cooldown or one-shot-send protection.
 Run `./start.sh` and launch a scenario with `▶ Scénario` to see live statuses.
 Resize the vertical separator to make the timeline taller, or drag the
 separator between the structured and general logs.
+
+## Visual workflow debugger (patch 0011)
+
+The resizable **bottom timeline** contains an opt-in debugger. Click **🐞
+Déboguer** while the runner is stopped, then **▶ Scénario**. Debug mode
+starts **paused before the first node**. **⏭ Pas** executes one entire
+node (including repeated OCR observations and waiting for a response), then
+pauses **before** the following node. **▶ Continuer** runs until the next
+user-defined breakpoint. While paused, the timeline and local execution trace
+remain visible. Both controls retain the normal project verification, user
+idle, quota, cooldown and at-most-once send checkpoints. An explicit
+confirmation shows the exact prompt before stepping into an **Envoyer prompt**
+node. Continue can run ordinary scheduled actions; treat it as a real run.
+
+Select a node in the graph or timeline and click **● Point d’arrêt** to
+toggle its breakpoint. Red dots are shown on the timeline. Breakpoints are
+stored privately in `~/.local/share/auto-ai-scheduler/breakpoints.json`
+(permissions 0600), containing **only opaque node IDs**. Debug mode is off
+by default on launch; it must be explicitly selected again after restart.
+
+Select an OCR node (or an OCR-based Si/Sinon block) and use **◉ Test OCR**
+while all runners are stopped/paused. It takes a fresh, verified screenshot
+of the selected Devin project, checks the selected local proof and ROI, then
+reports only a positive/negative result. It **never sends**, advances the
+workflow, persists a screenshot, or saves raw OCR text. An unavailable target
+or active quota is a negative result, not permission to proceed.
+
+This change extends the desktop GUI only; it does not run real X11/GTK tests
+on a headless build machine. Before unattended operation, test on KDE/X11.

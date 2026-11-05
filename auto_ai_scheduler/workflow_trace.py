@@ -55,6 +55,7 @@ REASONS = {
     'response_confirmed': 'Nouvelle réponse Codex terminée et confirmée',
     'response_blocked': 'Réponse interrompue par quota ou erreur',
     'idle_unavailable': 'Contrôle d’inactivité indisponible',
+    'debug_breakpoint': 'Débogueur : arrêt avant le bloc, utiliser Pas ou Continuer',
     'manual_pause': 'Pause demandée par l’utilisateur',
     'manual_stop': 'Arrêt demandé par l’utilisateur',
     'safety_block': 'Suspension par sécurité',

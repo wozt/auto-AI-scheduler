@@ -12,6 +12,7 @@ from .engine import Scheduler
 from .workflow import NODE_KINDS, WorkflowStore, planned_send
 from .workflow_run import WorkflowRunner
 from .workflow_checkpoint import CheckpointStore
+from .workflow_debug import BreakpointStore, dry_run_ocr
 from .proofs import ProofStore
 from . import editor
 
@@ -72,6 +73,9 @@ def launch():
             self.proof_store=ProofStore()
             self.graph=self.workflow_store.load()
             self.checkpoint_store=CheckpointStore()
+            self.breakpoint_store=BreakpointStore()
+            self.breakpoints=self.breakpoint_store.load()
+            self.debug_mode=False
             self.runner=WorkflowRunner(self.engine,self.proof_store,self.log,
                                        checkpoints=self.checkpoint_store)
             self._displayed_step=None
@@ -307,6 +311,17 @@ def launch():
                 btn.set_tooltip_text(help_text)
                 btn.connect('clicked',method)
                 bar.append(btn)
+            # Debug controls never advance the timeline without live validations.
+            debug_bar=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=6)
+            lower.append(debug_bar)
+            for key,label,callback,help_text in (
+                ('debug_mode','🐞 Déboguer',self.toggle_debug,'Mode debug : première étape en pause ; les envois restent protégés.'),
+                ('debug_step','⏭ Pas',self.debug_step,'Exécuter seulement le bloc courant, puis arrêter avant le prochain. Confirmer un vrai envoi.'),
+                ('debug_continue','▶ Continuer',self.debug_continue,'Continuer le scénario jusqu’au prochain point d’arrêt.'),
+                ('breakpoint','● Point d’arrêt',self.toggle_breakpoint,'Ajouter/retirer un point d’arrêt sur le bloc sélectionné.'),
+                ('ocr_test','◉ Test OCR',self.test_selected_ocr,'Tester seulement la preuve OCR sélectionnée : aucun prompt envoyé, aucune avancée.'),
+            ):
+                self.button(debug_bar,key,label,callback,help_text)
             self.runner_label=Gtk.Label(label='Scénario inactif',xalign=1)
             self.runner_label.set_hexpand(True)
             self.runner_label.set_ellipsize(Pango.EllipsizeMode.END)
@@ -360,9 +375,14 @@ def launch():
         def _timeline_components(self):
             return editor.timeline_widget(Gtk,self.graph,self.proof_store,self.select_node,
                                           active_id=lambda: self.runner.current.id if self.runner.phase in ('running','paused','approval') and self.runner.current else None,
-                                          trace=self.runner.trace)
+                                          trace=self.runner.trace, breakpoints=lambda: self.breakpoints)
 
         def graph_changed(self):
+            valid={n.id for n in self.graph.nodes}
+            if self.breakpoints - valid:
+                self.breakpoints.intersection_update(valid)
+                self.breakpoint_store.save(self.breakpoints)
+                self.runner.set_breakpoints(self.breakpoints)
             self.workflow_store.save(self.graph)
             if self.canvas:self.canvas.queue_draw()
             if self.timeline_reload:self.timeline_reload()
@@ -430,6 +450,10 @@ def launch():
                 panel.append(row)
             if node.kind in ('ocr','branch'):
                 self._ocr_editor(panel,node)
+            point=Gtk.Label(label=('● Point d’arrêt actif' if node.id in self.breakpoints else
+                                   '○ Aucun point d’arrêt'),xalign=0)
+            point.set_tooltip_text('Modifiable via ● Point d’arrêt dans la timeline. Réglage privé et local.')
+            panel.append(point)
             remove=Gtk.Button(label='Supprimer ce bloc')
             remove.set_tooltip_text('Supprime le bloc et ses connexions de ce scénario local.')
             remove.connect('clicked',lambda *_:self.remove_node(node.id))
@@ -673,6 +697,90 @@ def launch():
             dialog.connect('response', chosen)
             dialog.present()
 
+        def toggle_debug(self,*_):
+            if self.runner.phase not in ('stopped','done','error'):
+                self.log('Débogueur : arrêtez le scénario avant de changer de mode')
+                return
+            self.debug_mode=not self.debug_mode
+            self.runner.configure_debug(self.debug_mode,self.breakpoints)
+            self.log('Débogage ' + ('activé · premier bloc en pause' if self.debug_mode else 'désactivé'))
+            self.refresh()
+
+        def toggle_breakpoint(self,*_):
+            node=self.graph.find(self.selected)
+            if node is None:
+                self.log('Point d’arrêt : sélectionnez un bloc dans le graphe ou la timeline')
+                return
+            if node.id in self.breakpoints:
+                self.breakpoints.remove(node.id)
+            else:
+                self.breakpoints.add(node.id)
+            self.breakpoint_store.save(self.breakpoints)
+            self.runner.set_breakpoints(self.breakpoints)
+            if self.timeline_reload:self.timeline_reload()
+            self.update_inspector()
+            self.log(('Point d’arrêt ajouté : ' if node.id in self.breakpoints else
+                      'Point d’arrêt retiré : ')+node.label)
+
+        def debug_step(self,*_):
+            node=self.runner.current
+            if node is not None and node.kind=='send' and self.runner.phase=='paused':
+                prompt=node.params['prompt']
+                dialog=Adw.MessageDialog.new(self.window,'Pas-à-pas · envoyer un vrai prompt ?',
+                    'Le bloc « Envoyer prompt » va effectuer un envoi réel dans Codex.\n\n'
+                    'Prompt exact :\n'+prompt+'\n\nLe moteur vérifiera le projet, l’OCR, le quota et le cooldown.')
+                dialog.add_response('cancel','Annuler')
+                dialog.add_response('send','Autoriser ce pas')
+                dialog.set_response_appearance('send',Adw.ResponseAppearance.DESTRUCTIVE)
+                dialog.set_default_response('cancel')
+                dialog.set_close_response('cancel')
+                def confirmed(_dialog,response):
+                    if response=='send':
+                        try:self.runner.debug_step(send_confirmed=True)
+                        except (ValueError,OSError) as exc:self.log('Pas refusé : '+str(exc))
+                    self.refresh()
+                dialog.connect('response',confirmed)
+                dialog.present()
+                return
+            try:self.runner.debug_step()
+            except (ValueError,OSError) as exc:self.log('Pas refusé : '+str(exc))
+            self.refresh()
+
+        def debug_continue(self,*_):
+            node=self.runner.current
+            if node is not None and node.kind=='send' and self.runner.phase=='paused':
+                prompt=node.params['prompt']
+                dialog=Adw.MessageDialog.new(self.window,'Continuer · envoi réel dans Codex ?',
+                     'La reprise va exécuter le prompt sélectionné.\n\nPrompt :\n'+prompt+
+                     '\n\nLes contrôles OCR, quota, cooldown et anti-doublon restent actifs.')
+                dialog.add_response('cancel','Annuler')
+                dialog.add_response('send','Autoriser la reprise')
+                dialog.set_response_appearance('send',Adw.ResponseAppearance.DESTRUCTIVE)
+                dialog.set_default_response('cancel')
+                dialog.set_close_response('cancel')
+                def confirmed(_dialog,response):
+                    if response=='send':
+                        try:self.runner.debug_continue(send_confirmed=True)
+                        except (ValueError,OSError) as exc:self.log('Continuer refusé : '+str(exc))
+                    self.refresh()
+                dialog.connect('response',confirmed)
+                dialog.present()
+                return
+            try:self.runner.debug_continue()
+            except (ValueError,OSError) as exc:self.log('Continuer refusé : '+str(exc))
+            self.refresh()
+
+        def test_selected_ocr(self,*_):
+            node=self.graph.find(self.selected)
+            try:
+                if self.runner.phase=='running' or self.controls.phase=='running':
+                    raise ValueError('Mettez l’exécution en pause avant de tester l’OCR')
+                result=dry_run_ocr(self.engine,self.proof_store,node)
+                self.log('Test OCR local : '+result.description+' · Codex '+result.state)
+            except (ValueError,OSError) as exc:
+                self.log('Test OCR refusé : '+str(exc))
+            self.refresh()
+
         def workflow_start(self,*_):
             try:
                 if self.runner.phase == 'paused':
@@ -681,6 +789,7 @@ def launch():
                     if self.controls.phase == 'running':
                         self.controls.stop()
                     self.workflow_store.save(self.graph)
+                    self.runner.configure_debug(self.debug_mode,self.breakpoints)
                     self.runner.start(self.graph)
                 self.refresh()
             except ValueError as exc:
@@ -692,6 +801,7 @@ def launch():
                     self.controls.stop()
                 # Load exact saved graph. Unsaved visual changes must never
                 # substitute a different prompt when restoring a checkpoint.
+                self.runner.configure_debug(self.debug_mode,self.breakpoints)
                 self.runner.restore(self.workflow_store.load())
                 self.refresh()
             except (ValueError, OSError) as exc:
@@ -791,6 +901,8 @@ def launch():
                         if saved:caption='⚠ Progression sauvegardée · ↶ Restaurer (aucune exécution automatique)'
                     except (ValueError,OSError):
                         caption='⚠ Checkpoint illisible · démarrage désactivé'
+                if self.debug_mode:
+                    caption='🐞 ' + caption
                 self.runner_label.set_text(caption)
             displayed=self.runner.current.id if self.runner.current and self.runner.phase in ('running','paused','approval') else None
             if self._displayed_step!=displayed:
@@ -806,6 +918,15 @@ def launch():
                     '\n'.join(lines) if lines else 'Aucune étape exécutée dans cette session.')
                 self._shown_trace_revision=self.runner.trace.revision
             self.next_label.set_tooltip_text(upcoming)
+            if 'debug_mode' in self.buttons:
+                if self.debug_mode:
+                    self.buttons['debug_mode'].add_css_class('suggested-action')
+                else:
+                    self.buttons['debug_mode'].remove_css_class('suggested-action')
+                self.buttons['debug_step'].set_sensitive(self.debug_mode and self.runner.phase=='paused')
+                self.buttons['debug_continue'].set_sensitive(self.debug_mode and self.runner.phase=='paused')
+                self.buttons['breakpoint'].set_sensitive(self.graph.find(self.selected) is not None)
+                self.buttons['ocr_test'].set_sensitive(self.graph.find(self.selected) is not None)
             if 'force_test' in self.buttons:
                 self.buttons['force_test'].set_sensitive(
                     planned_send(self.graph, self.selected) is not None)
