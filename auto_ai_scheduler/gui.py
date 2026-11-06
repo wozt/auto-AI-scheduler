@@ -15,6 +15,8 @@ from .workflow_checkpoint import CheckpointStore
 from .workflow_debug import BreakpointStore, dry_run_ocr
 from .workflow_sim import SimulationInputs, simulate
 from .workflow_record import SequenceRecorder, RecordingStore, replay, MAX_FRAMES
+from .workflow_inspect import REFERENCE_PATH, save_comparison_reference
+from . import workflow_inspect_ui
 from .schedule import parse_local
 from .proofs import ProofStore
 from . import editor
@@ -83,6 +85,13 @@ def launch():
             self.recorder=SequenceRecorder(self.recording_store)
             self.recording_status=None
             self.recording_interval=None
+            self.reference_store=RecordingStore(REFERENCE_PATH)
+            self.recording_data=None
+            self.reference_data=None
+            self.recording_cursor=0
+            self.recording_zoom=1
+            self.recording_compare=False
+            self.recording_inspector_update=None
             self.simulation_images={}
             self.simulation_result=None
             self.simulation_status=None
@@ -421,7 +430,9 @@ def launch():
             recorder_scroll.set_propagate_natural_width(False)
             recorder_scroll.set_min_content_width(510)
             recorder_scroll.set_child(record_controls)
-            recorder_expander.set_child(recorder_scroll)
+            recorder_panel=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=6)
+            recorder_panel.append(recorder_scroll)
+            recorder_expander.set_child(recorder_panel)
             record_controls.append(Gtk.Label(label='Intervalle (s) :'))
             self.recording_interval=Gtk.SpinButton.new_with_range(3,30,1)
             self.recording_interval.set_value(3)
@@ -441,6 +452,11 @@ def launch():
             self.recording_status.set_hexpand(True)
             self.recording_status.set_tooltip_text('Seules les valeurs OUI/NON/indéterminé, les états et les heures sont stockées ; ni captures ni prompts.')
             record_controls.append(self.recording_status)
+            frame_inspector,frame_update=workflow_inspect_ui.make_inspector(
+                Gtk,self._recording_view_state,self.seek_recording_frame,
+                self.zoom_recording,self.pin_recording,self.compare_recording)
+            self.recording_inspector_update=frame_update
+            recorder_panel.append(frame_inspector)
             self.runner_label=Gtk.Label(label='Scénario inactif',xalign=1)
             self.runner_label.set_hexpand(True)
             self.runner_label.set_ellipsize(Pango.EllipsizeMode.END)
@@ -942,6 +958,81 @@ def launch():
                     self.log('Import simulation refusé : '+str(exc))
             dialog.open(self.window,None,done)
 
+        def _recording_view_state(self):
+            labels={node.id:node.label for node in self.graph.nodes}
+            return (self.recording_data,self.reference_data,self.recording_cursor,
+                    self.recording_zoom,self.recording_compare,labels)
+
+        def seek_recording_frame(self,index,relative=False):
+            """Read-only preview of a recorded prefix; NEVER runs desktop actions."""
+            if self.recorder.active or self.recording_data is None:
+                return
+            frames=self.recording_data['frames']
+            index=self.recording_cursor+index if relative else index
+            self.recording_cursor=max(0,min(len(frames)-1,int(index)))
+            prefix={**self.recording_data,'frames':frames[:self.recording_cursor+1]}
+            try:
+                self.simulation_result=replay(self.graph,prefix,self.proof_store,
+                    quota_approved=bool(self.simulation_approved and self.simulation_approved.get_active()))
+            except (ValueError,OSError) as exc:
+                self.simulation_result=None
+                self.log('Aperçu de trame indisponible : '+str(exc))
+            if self.recording_inspector_update:self.recording_inspector_update()
+            if self.timeline_reload:self.timeline_reload()
+            self.recording_status.set_text(f'Trame {self.recording_cursor+1}/{len(frames)} · relecture HORS LIGNE')
+
+        def zoom_recording(self,zoom):
+            zoom=int(zoom)
+            if self.recording_zoom==zoom:return
+            self.recording_zoom=zoom
+            if self.recording_inspector_update:self.recording_inspector_update()
+
+        def pin_recording(self):
+            if self.recorder.active:
+                self.log('Terminez la capture avant de l’épingler')
+                return
+            try:
+                data=self.recording_data or self.recording_store.load()
+                if data is None:raise ValueError('Aucun enregistrement à épingler')
+            except (ValueError,OSError) as exc:
+                self.log('Référence refusée : '+str(exc));return
+            dialog=Adw.MessageDialog.new(self.window,'Épingler la séquence comme référence ?',
+                'Cette opération conserve une copie privée des états OCR (sans images, sans prompts). '
+                'Une référence précédente sera remplacée. Le fichier reste sur cet ordinateur.')
+            dialog.add_response('cancel','Annuler')
+            dialog.add_response('save','Épingler')
+            dialog.set_default_response('cancel')
+            dialog.set_close_response('cancel')
+            def chosen(_dialog,response):
+                if response!='save':return
+                try:
+                    save_comparison_reference(data,self.reference_store)
+                    self.reference_data=self.reference_store.load()
+                    self.recording_compare=False
+                    if self.recording_inspector_update:self.recording_inspector_update()
+                    self.log('Référence OCR épinglée localement (0600)')
+                except (ValueError,OSError) as exc:self.log('Référence refusée : '+str(exc))
+            dialog.connect('response',chosen)
+            dialog.present()
+
+        def compare_recording(self):
+            if self.recorder.active:
+                self.log('Terminez la capture avant toute comparaison')
+                return
+            try:
+                if self.recording_data is None:self.recording_data=self.recording_store.load()
+                if self.recording_data is None:raise ValueError('Aucun enregistrement actuel à comparer')
+                self.reference_data=self.reference_store.load()
+                if self.reference_data is None:raise ValueError('Épinglez une référence puis réalisez une autre capture')
+                from .workflow_inspect import compare_frames
+                compare_frames(self.recording_data,self.reference_data,self.recording_cursor)
+                self.recording_compare=not self.recording_compare
+                if self.recording_inspector_update:self.recording_inspector_update()
+                self.log('Comparaison OCR : '+('activée' if self.recording_compare else 'désactivée'))
+            except (ValueError,OSError) as exc:
+                self.recording_compare=False
+                self.log('Comparaison refusée : '+str(exc))
+
         def start_recording(self,*_):
             if self.controls.phase=='running' or self.runner.phase in ('running','paused','approval') or self.engine.force_test_pending:
                 self.log('Séquence : arrêtez les exécuteurs réels avant de capturer')
@@ -958,6 +1049,9 @@ def launch():
         def stop_recording(self,*_):
             try:
                 document=self.recorder.stop()
+                self.recording_data=document
+                self.recording_cursor=0
+                if self.recording_inspector_update:self.recording_inspector_update()
                 self.recording_status.set_text('Séquence enregistrée · '+str(len(document['frames']))+' états')
                 self.log('Séquence locale sauvegardée, sans image ni transcription OCR')
             except (ValueError,OSError) as exc:
@@ -970,6 +1064,10 @@ def launch():
                 return
             try:
                 recording=self.recording_store.load()
+                if recording is not None:
+                    self.recording_data=recording
+                    self.recording_cursor=len(recording['frames'])-1
+                    if self.recording_inspector_update:self.recording_inspector_update()
                 if recording is None:
                     raise ValueError('Aucun enregistrement ; utilisez Enregistrer puis Terminer')
                 # Offline ONLY. No call to Scheduler / x11 / SMTP here.
@@ -1004,6 +1102,10 @@ def launch():
                     return
                 try:
                     self.recording_store.clear()
+                    self.recording_data=None
+                    self.recording_compare=False
+                    self.recording_cursor=0
+                    if self.recording_inspector_update:self.recording_inspector_update()
                     self.simulation_result=None
                     self.recording_status.set_text('Séquence privée effacée')
                     if self.timeline_reload:self.timeline_reload()

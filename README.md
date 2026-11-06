@@ -443,3 +443,36 @@ it against a different prompt. This is a simulation of a captured session,
 The original static simulation controls and the existing execution/debug
 checkpoint system are untouched. A quota-wait that requires local approval
 also requires the explicit **Approbation fictive** checkbox when replaying.
+
+## Navigable recorded-state timeline and A/B comparison (patch 0014)
+
+Expand **🎞 Séquence OCR** in the **bottom resizable timeline**. A new
+**TRAMES OCR** track shows the sequence as colored *state markers*, not image
+thumbnails: patch 0013 intentionally never stores screenshots. Move the
+scrubber, click an observation on the ruler or use **◀ / ▶** to inspect one
+recorded observation at a time. **Zoom 1×–8×** changes the visible time span
+around the selected frame without altering the file. The current state, local
+timestamp, composer presence, quota-deadline presence and each OCR node's
+YES / NO / unknown value are shown in read-only, scrollable panels. Never
+interpret unknown OCR as negative proof.
+
+Click **📌 Épingler référence** and confirm to save a second private recording
+`~/.local/share/auto-ai-scheduler/recordings/reference.json`. The existing
+`last.json` remains independent, so you can capture a second session without
+overwriting the comparison reference. Both are local JSON files with mode
+0600; the directory is 0700. Click **⇄ Comparer** after opening the new last
+recording to compare the selected frame against the nearest frame by *relative
+elapsed time*, rather than by index or absolute clock. The reference must
+belong to the exact same workflow fingerprint; otherwise comparison refuses
+without attempting to reinterpret its OCR results.
+
+Scrubbing also shows the **offline replay outcome up to that frame** on the
+existing scenario clips, never changing the live runner or its checkpoint.
+Nothing in inspection, replay or comparison calls X11, Scheduler.send, SMTP,
+or external services. Existing **Force test** remains a separate, real-send
+button; the inspection controls do not dispatch any Codex command.
+
+The GTK layout is designed to stay compact on 1080p screens: the new
+information panels scroll inside the expandable sequence area. Headless
+unit tests cover time alignment, input validation, redaction and zero desktop
+side-effects; actual KDE/GTK behavior still needs live confirmation.
