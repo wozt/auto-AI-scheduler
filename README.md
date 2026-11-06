@@ -503,3 +503,21 @@ lasso, group movement, non-mutation of graph during camera changes). GTK events
 are wired on the desktop at runtime; check wheel/pan behavior on your KDE/X11
 setup after applying the patch. No screenshots, prompts, runtime settings or
 OCR transcripts are included in the patch.
+
+
+## Undo/Redo and minimap (patch 0016)
+
+The central GTK4 graph editor now supports **Ctrl+Z**, **Ctrl+Y** or **Ctrl+Shift+Z**
+when the canvas has focus, plus explicit Undo/Redo toolbar buttons. Each grouped
+drag or link is one history entry; edits to the same property are coalesced.
+The history is bounded to 80 in-memory versions and is not a recovery checkpoint.
+Undo/Redo restores the same graph object and updates the local workflow file,
+but never runs or rewinds Codex, sends X11 events, or changes a live runner.
+Text entries retain their native keyboard handling when they have focus.
+
+A **Minimap** is overlaid at the lower-right of the central canvas, not in the
+bottom timeline. It shows blocks, links and the current viewport; click or drag
+inside it to pan without modifying graph coordinates or connections. A toolbar
+button toggles it; zoom, fit and ordinary pans update the view rectangle.
+The existing timeline, OCR, checkpoint, and execution engines are unchanged.
+Live GTK input behavior still needs checking on a Debian/KDE X11 desktop.

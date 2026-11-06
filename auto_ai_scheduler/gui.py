@@ -21,6 +21,8 @@ from .schedule import parse_local
 from .proofs import ProofStore
 from . import editor
 from .canvas_view import CanvasView
+from .workflow_history import GraphHistory
+from . import workflow_minimap
 
 LEFT_SECTIONS = (
     ('Cible X11', ('project', 'app_pattern', 'prompt', 'mode')),
@@ -119,6 +121,12 @@ def launch():
             self.log_widget=None
             self.canvas=None
             self.canvas_view=CanvasView()
+            self.graph_history=GraphHistory(self.graph)
+            self.minimap=None
+            self.minimap_visible=True
+            self.canvas_undo_button=None
+            self.canvas_redo_button=None
+            self._pending_param_tag=None
             self.canvas_zoom_label=None
             self.timeline_reload=None
             self.timeline_update_trace=None
@@ -308,6 +316,17 @@ def launch():
                 'Molette : zoom · Clic milieu ou Espace+glisser : déplacer la vue · Maj/Ctrl : sélection multiple'))
             bar=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=5)
             wrap.append(bar)
+            undo=Gtk.Button(label='↶ Annuler')
+            undo.set_tooltip_text('Ctrl+Z dans le canevas · Annuler la dernière modification du graphe, sans action dans Codex.')
+            undo.connect('clicked',self.graph_undo)
+            bar.append(undo)
+            self.canvas_undo_button=undo
+            redo=Gtk.Button(label='↷ Rétablir')
+            redo.set_tooltip_text('Ctrl+Y ou Ctrl+Maj+Z dans le canevas · Rétablir une modification annulée.')
+            redo.connect('clicked',self.graph_redo)
+            bar.append(redo)
+            self.canvas_redo_button=redo
+            self.update_history_controls()
             for label,factor,tip in (
                 ('−',1/1.2,'Dézoomer autour du centre de la zone visible.'),
                 ('+',1.2,'Zoomer autour du centre de la zone visible.'),
@@ -328,15 +347,70 @@ def launch():
             self.canvas_zoom_label.set_hexpand(True)
             self.canvas_zoom_label.set_tooltip_text('Zoom du canevas : 45 à 250 %. Sauvegarder le scénario ne sauvegarde pas le point de vue.')
             bar.append(self.canvas_zoom_label)
+            minimap_toggle=Gtk.Button(label='▣ Minimap')
+            minimap_toggle.set_tooltip_text('Afficher ou masquer la carte miniature du graphe. Cliquez dans la minimap pour centrer le canevas.')
+            minimap_toggle.connect('clicked',self.toggle_minimap)
+            bar.append(minimap_toggle)
             self.canvas=editor.canvas_widget(
                 Gtk,self.graph,self.select_node,self.graph_changed,self.log,
-                self.cfg['font_size'],view=self.canvas_view,on_view_changed=self.canvas_refresh_zoom)
-            wrap.append(self.canvas)
+                self.cfg['font_size'],view=self.canvas_view,on_view_changed=self.canvas_refresh_zoom,
+                on_undo=self.graph_undo,on_redo=self.graph_redo,
+                on_before_edit=self.flush_pending_graph_edit)
+            overlay=Gtk.Overlay()
+            overlay.set_hexpand(True)
+            overlay.set_vexpand(True)
+            overlay.set_child(self.canvas)
+            self.minimap=workflow_minimap.minimap_widget(
+                Gtk,self.graph,self.canvas_view,
+                lambda:(self.canvas.get_width(),self.canvas.get_height()),
+                self.canvas_view_changed)
+            overlay.add_overlay(self.minimap)
+            wrap.append(overlay)
             return wrap
 
         def canvas_refresh_zoom(self):
             if self.canvas_zoom_label is not None:
                 self.canvas_zoom_label.set_text(f'{round(self.canvas_view.zoom*100)} %')
+            if self.minimap is not None:self.minimap.queue_draw()
+
+        def canvas_view_changed(self):
+            if self.canvas:self.canvas.queue_draw()
+            self.canvas_refresh_zoom()
+
+        def toggle_minimap(self,*_):
+            self.minimap_visible=not self.minimap_visible
+            if self.minimap:self.minimap.set_visible(self.minimap_visible)
+
+        def update_history_controls(self):
+            if self.canvas_undo_button:
+                self.canvas_undo_button.set_sensitive(self.graph_history.can_undo)
+            if self.canvas_redo_button:
+                self.canvas_redo_button.set_sensitive(self.graph_history.can_redo)
+
+        def flush_pending_graph_edit(self):
+            if self._save_timeout is None:
+                return
+            GLib.source_remove(self._save_timeout)
+            self._save_timeout=None
+            tag=self._pending_param_tag
+            self._pending_param_tag=None
+            self.graph_changed(merge_tag=tag)
+
+        def graph_undo(self,*_):
+            self.flush_pending_graph_edit()
+            if self.graph_history.undo(self.graph):
+                self.graph_changed(record=False)
+                self.select_node(self.selected if self.graph.find(self.selected) else None)
+                self.log('↶ Modification du graphe annulée')
+            self.update_history_controls()
+
+        def graph_redo(self,*_):
+            self.flush_pending_graph_edit()
+            if self.graph_history.redo(self.graph):
+                self.graph_changed(record=False)
+                self.select_node(self.selected if self.graph.find(self.selected) else None)
+                self.log('↷ Modification du graphe rétablie')
+            self.update_history_controls()
 
         def canvas_zoom(self,factor):
             if self.canvas is None:return
@@ -557,7 +631,10 @@ def launch():
                                            trace=self.runner.trace, breakpoints=lambda: self.breakpoints,
                                            simulation=lambda:self.simulation_result)
 
-        def graph_changed(self):
+        def graph_changed(self,merge_tag=None,record=True):
+            if record:
+                self.graph_history.record(self.graph,merge_tag=merge_tag)
+            self.update_history_controls()
             # A modified graph invalidates an old, read-only preview.
             self.simulation_result=None
             self.simulation_images={ident:proof for ident,proof in self.simulation_images.items()
@@ -571,10 +648,12 @@ def launch():
             self.workflow_store.save(self.graph)
             self.canvas_view.prune(self.graph)
             if self.canvas:self.canvas.queue_draw()
+            if self.minimap:self.minimap.queue_draw()
             if self.timeline_reload:self.timeline_reload()
             if self.timeline_update_trace:self.timeline_update_trace()
 
         def add_node(self,kind):
+            self.flush_pending_graph_edit()
             count=len(self.graph.nodes)
             node=self.graph.add(kind,100+(count%4)*260,80+(count//4)*125)
             self.graph_changed()
@@ -589,6 +668,7 @@ def launch():
             self.selected=ident
             self.update_inspector()
             if self.canvas:self.canvas.queue_draw()
+            if self.minimap:self.minimap.queue_draw()
 
         def update_inspector(self):
             if self.inspector is None:return
@@ -692,16 +772,23 @@ def launch():
             dialog.open(self.window,None,done)
 
         def param_changed(self,node,key,value):
+            tag=f'param:{node.id}:{key}'
+            if self._save_timeout is not None and self._pending_param_tag != tag:
+                self.flush_pending_graph_edit()
             node.params[key]=value
             if self._save_timeout is not None:
                 GLib.source_remove(self._save_timeout)
+            self._pending_param_tag=tag
             def flush():
                 self._save_timeout=None
-                self.graph_changed()
+                changed_tag=self._pending_param_tag
+                self._pending_param_tag=None
+                self.graph_changed(merge_tag=changed_tag)
                 return False
             self._save_timeout=GLib.timeout_add(450,flush)
 
         def remove_node(self,ident):
+            self.flush_pending_graph_edit()
             self.graph.delete(ident)
             self.graph_changed()
             self.select_node(None)
@@ -730,6 +817,7 @@ def launch():
                 self.log('Test OCR : '+str(exc))
 
         def save_workflow(self,*_):
+            self.flush_pending_graph_edit()
             self.graph_changed()
             self.log('Scénario sauvegardé localement. Un clic sur ▶ Scénario est requis pour exécuter.')
 

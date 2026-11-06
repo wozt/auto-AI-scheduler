@@ -254,7 +254,9 @@ class GuiContract(unittest.TestCase):
         self.assertIn('Cadrer les blocs',gui)
         self.assertIn('self.canvas_view=CanvasView()',gui)
         self.assertIn('vertical.set_end_child(self.make_timeline())',gui)
-        self.assertIn('wrap.append(self.canvas)',gui)
+        self.assertIn('overlay.set_child(self.canvas)',gui)
+        self.assertIn('wrap.append(overlay)',gui)
+        self.assertIn('self.minimap=workflow_minimap.minimap_widget(',gui)
         self.assertNotIn('viewport.set_child(self.canvas)',gui)
 
 

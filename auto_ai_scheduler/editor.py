@@ -16,7 +16,7 @@ def hit_node(graph, x, y):
     return None
 
 
-def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12, view=None, on_view_changed=None):
+def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12, view=None, on_view_changed=None, on_undo=None, on_redo=None, on_before_edit=None):
     """GTK4 viewport editor: wheel zoom, pan, lasso, multi-drag and safe wiring.
 
     Only node dragging mutates workflow positions. Camera/selection never
@@ -201,6 +201,7 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12, view=N
             on_message('Connexion : sortie '+(pending['branch'] or 'unique')+' → port gauche de destination')
         elif n is not None and wx <= n.x+18 and pending['from']:
             try:
+                if on_before_edit is not None:on_before_edit()
                 graph.connect(pending['from'], n.id, branch=pending['branch'])
                 on_changed()
                 on_message('Blocs connectés')
@@ -232,6 +233,7 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12, view=N
             wx, wy = view.screen_to_world(sx, sy)
             if wx <= node.x+18 or wx >= node.x+NODE_W-18:
                 return
+            if on_before_edit is not None:on_before_edit()
             if node.id not in view.selected:
                 view.choose(node.id, additive=drag['additive'])
                 changed_selection(node.id)
@@ -251,9 +253,11 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12, view=N
             lx, ly = drag['last']
             view.pan_by(dx-lx, dy-ly)
             drag['last'] = (dx,dy)
+            if on_view_changed is not None:on_view_changed()
         elif mode == 'rectangle':
             sx, sy = drag['start']
             drag['rectangle'] = (sx,sy,sx+dx,sy+dy)
+        if mode == 'nodes' and on_view_changed is not None:on_view_changed()
         area.queue_draw()
 
     def finish(_gesture, dx, dy):
@@ -281,6 +285,7 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12, view=N
         lx, ly = drag['last']
         view.pan_by(dx-lx,dy-ly)
         drag['last'] = (dx,dy)
+        if on_view_changed is not None:on_view_changed()
         area.queue_draw()
     middle = Gtk.GestureDrag()
     middle.set_button(2)
@@ -289,6 +294,14 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12, view=N
     area.add_controller(middle)
 
     def key_pressed(_controller, key, _keycode, state):
+        if state & Gdk.ModifierType.CONTROL_MASK:
+            if key in (getattr(Gdk,"KEY_z",ord("z")),getattr(Gdk,"KEY_Z",ord("Z"))) and on_undo is not None and not state & Gdk.ModifierType.SHIFT_MASK:
+                on_undo()
+                return True
+            if ((key in (getattr(Gdk,"KEY_z",ord("z")),getattr(Gdk,"KEY_Z",ord("Z"))) and state & Gdk.ModifierType.SHIFT_MASK) or
+                key in (getattr(Gdk,"KEY_y",ord("y")),getattr(Gdk,"KEY_Y",ord("Y")))) and on_redo is not None:
+                on_redo()
+                return True
         if key == Gdk.KEY_space:
             pointer['space'] = True
             return True

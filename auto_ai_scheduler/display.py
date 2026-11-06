@@ -24,6 +24,7 @@ def css(font_size):
             '.scheduler-status.found {color:#57c88d;background:alpha(#208a50,.14);}'
             '.scheduler-panel {padding:6px;} '
             '.scheduler-timeline {background:alpha(@window_fg_color,.027);}'
+            '.scheduler-minimap {border:1px solid alpha(@window_fg_color,.3);border-radius:5px;}'
             '.scheduler-clip-active {outline:2px solid #50c983;outline-offset:-2px;}'
             '.scheduler-breakpoint {color:#e66b60;font-weight:700;}'
             '.scheduler-trace-done {border:1px solid #42a576;}'
