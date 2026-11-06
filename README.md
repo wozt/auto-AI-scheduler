@@ -407,3 +407,39 @@ workflow checkpoints, clears real breakpoints or advances the live timeline.
 The existing Force test is **still real** and separate from this preview.
 The preview exists only in app memory and is cleared when the graph changes
 or a live scenario starts. Visual behavior requires KDE/X11 testing.
+
+## Temporal OCR recording and offline replay (patch 0013)
+
+A **🎞 Séquence OCR** expander is available in the bottom, resizable timeline.
+Click **⏺ Enregistrer** to start a bounded observation sequence, **⏹ Terminer**
+to save it, then **▶ Rejouer** to preview the graph against those successive
+observations. **✕ Effacer** deletes the private recording after confirmation.
+The 3–30 second sampling interval is adjustable, with a maximum of 120 frames.
+
+The recorder inspects **only a verified Devin + Explorer project + Codex** window,
+using the existing X11 focus-restoration code and respecting `idle_seconds`.
+If the desktop is being used, it **skips** sampling rather than interrupting
+what you are doing. The live supervisor and visual scenario executor cannot run
+in parallel with a recording. A recording never clicks or types in Codex.
+
+**Privacy:** Only local timestamps, Codex state, whether the composer was seen,
+hashes of cycle markers, quota reset deadlines (if explicitly recognized), and
+per-node OCR values **true / false / unknown** are stored. Screenshots are used
+only in memory for OCR and are **never** saved or committed. Neither the
+recognized text nor prompt content is recorded. The single local recording
+is stored as `~/.local/share/auto-ai-scheduler/recordings/last.json`, with
+`0700` on its parent and `0600` on the file. It is not in the Git tree.
+
+Replay is deterministic and **entirely offline**: it uses the actual sequence
+of recorded states instead of applying one global state to every workflow block.
+Two consecutive confirmations are required for event, OCR, state and branch
+transitions; unavailable OCR stays **unknown** rather than implying a NO
+branch. Clock and delay nodes use the recorded timestamps. Prompt, scroll and
+mail nodes display **would execute** without ever dispatching an action.
+A changed scenario fingerprint invalidates the recording rather than replaying
+it against a different prompt. This is a simulation of a captured session,
+**not proof that an action would succeed in a future live session**.
+
+The original static simulation controls and the existing execution/debug
+checkpoint system are untouched. A quota-wait that requires local approval
+also requires the explicit **Approbation fictive** checkbox when replaying.

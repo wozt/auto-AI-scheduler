@@ -14,6 +14,7 @@ from .workflow_run import WorkflowRunner
 from .workflow_checkpoint import CheckpointStore
 from .workflow_debug import BreakpointStore, dry_run_ocr
 from .workflow_sim import SimulationInputs, simulate
+from .workflow_record import SequenceRecorder, RecordingStore, replay, MAX_FRAMES
 from .schedule import parse_local
 from .proofs import ProofStore
 from . import editor
@@ -78,6 +79,10 @@ def launch():
             self.breakpoint_store=BreakpointStore()
             self.breakpoints=self.breakpoint_store.load()
             self.debug_mode=False
+            self.recording_store=RecordingStore()
+            self.recorder=SequenceRecorder(self.recording_store)
+            self.recording_status=None
+            self.recording_interval=None
             self.simulation_images={}
             self.simulation_result=None
             self.simulation_status=None
@@ -405,6 +410,37 @@ def launch():
             self.simulation_status.set_ellipsize(Pango.EllipsizeMode.END)
             self.simulation_status.set_tooltip_text('Résultat de la dernière simulation, uniquement en mémoire ; aucune capture ou OCR brut dans les logs.')
             simrow3.append(self.simulation_status)
+            recorder_expander=Gtk.Expander(label='🎞 Séquence OCR · enregistrer / rejouer les états de Codex')
+            recorder_expander.set_tooltip_text(
+                'Capture volontaire de résultats OCR OUI/NON et des états Codex. '
+                'Aucune image ni transcription n’est enregistrée sur disque ; relecture entièrement hors ligne.')
+            lower.append(recorder_expander)
+            record_controls=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=6)
+            recorder_scroll=Gtk.ScrolledWindow()
+            recorder_scroll.set_policy(Gtk.PolicyType.AUTOMATIC,Gtk.PolicyType.NEVER)
+            recorder_scroll.set_propagate_natural_width(False)
+            recorder_scroll.set_min_content_width(510)
+            recorder_scroll.set_child(record_controls)
+            recorder_expander.set_child(recorder_scroll)
+            record_controls.append(Gtk.Label(label='Intervalle (s) :'))
+            self.recording_interval=Gtk.SpinButton.new_with_range(3,30,1)
+            self.recording_interval.set_value(3)
+            self.recording_interval.set_width_chars(3)
+            self.recording_interval.set_tooltip_text('Une observation toutes les 3 à 30 secondes, jusqu’à 120 mesures. La fenêtre doit être vérifiée et le bureau inactif.')
+            record_controls.append(self.recording_interval)
+            self.button(record_controls,'record_start','⏺ Enregistrer',self.start_recording,
+                        'Enregistrer une séquence des états Codex et des décisions OCR. Aucun prompt envoyé ; images temporaires non sauvegardées.')
+            self.button(record_controls,'record_stop','⏹ Terminer',self.stop_recording,
+                        'Arrêter et sauvegarder localement la séquence anonymisée (0600), sans capture ni texte OCR brut.')
+            self.button(record_controls,'record_replay','▶ Rejouer',self.replay_recording,
+                        'Rejouer hors ligne les étapes du graphe à partir des observations temporelles. Aucune interaction X11, aucun envoi.')
+            self.button(record_controls,'record_clear','✕ Effacer',self.clear_recording,
+                        'Effacer après confirmation la dernière séquence privée sur disque.')
+            self.recording_status=Gtk.Label(label='Pas d’enregistrement actif',xalign=0)
+            self.recording_status.set_ellipsize(Pango.EllipsizeMode.END)
+            self.recording_status.set_hexpand(True)
+            self.recording_status.set_tooltip_text('Seules les valeurs OUI/NON/indéterminé, les états et les heures sont stockées ; ni captures ni prompts.')
+            record_controls.append(self.recording_status)
             self.runner_label=Gtk.Label(label='Scénario inactif',xalign=1)
             self.runner_label.set_hexpand(True)
             self.runner_label.set_ellipsize(Pango.EllipsizeMode.END)
@@ -746,6 +782,9 @@ def launch():
             else:self.log(f'Projet confirmé · Codex {obs.state}')
 
         def send(self,*_):
+            if self.recorder.active:
+                self.log('Envoi refusé pendant la capture OCR')
+                return
             if self.runner.phase in ('running','paused','approval'):
                 self.log('Envoi manuel interdit pendant un scénario armé ; arrêtez-le d’abord')
                 return
@@ -753,6 +792,9 @@ def launch():
                 self.log('Envoi manuel refusé (état, quota, projet ou cooldown)')
 
         def force_test(self,*_):
+            if self.recorder.active:
+                self.log('Force test refusé pendant la capture OCR')
+                return
             if self.runner.phase in ('running','paused','approval'):
                 self.log('Force test indépendant : arrêtez le scénario avant tout envoi')
                 return
@@ -778,6 +820,9 @@ def launch():
             dialog.set_close_response('cancel')
             def chosen(_dialog, response):
                 if response != 'send':
+                    return
+                if self.recorder.active:
+                    self.log('Force test annulé : capture OCR démarrée depuis la confirmation')
                     return
                 if not self.engine.force_test(prompt):
                     self.log('Force test refusé : contrôle projet/Codex, quota, travail actif ou cooldown')
@@ -812,6 +857,9 @@ def launch():
                       'Point d’arrêt retiré : ')+node.label)
 
         def debug_step(self,*_):
+            if self.recorder.active:
+                self.log('Débogage refusé pendant la capture OCR')
+                return
             node=self.runner.current
             if node is not None and node.kind=='send' and self.runner.phase=='paused':
                 prompt=node.params['prompt']
@@ -836,6 +884,9 @@ def launch():
             self.refresh()
 
         def debug_continue(self,*_):
+            if self.recorder.active:
+                self.log('Débogage refusé pendant la capture OCR')
+                return
             node=self.runner.current
             if node is not None and node.kind=='send' and self.runner.phase=='paused':
                 prompt=node.params['prompt']
@@ -891,6 +942,77 @@ def launch():
                     self.log('Import simulation refusé : '+str(exc))
             dialog.open(self.window,None,done)
 
+        def start_recording(self,*_):
+            if self.controls.phase=='running' or self.runner.phase in ('running','paused','approval') or self.engine.force_test_pending:
+                self.log('Séquence : arrêtez les exécuteurs réels avant de capturer')
+                return
+            try:
+                self.recorder.start(self.graph,self.recording_interval.get_value_as_int())
+                self.simulation_result=None
+                self.recording_status.set_text('⏺ Capture active · 0/'+str(MAX_FRAMES))
+                self.log('Capture OCR volontaire démarrée : uniquement états et booléens, aucune image sauvegardée')
+            except ValueError as exc:
+                self.log('Séquence refusée : '+str(exc))
+            self.refresh()
+
+        def stop_recording(self,*_):
+            try:
+                document=self.recorder.stop()
+                self.recording_status.set_text('Séquence enregistrée · '+str(len(document['frames']))+' états')
+                self.log('Séquence locale sauvegardée, sans image ni transcription OCR')
+            except (ValueError,OSError) as exc:
+                self.log('Séquence : '+str(exc))
+            self.refresh()
+
+        def replay_recording(self,*_):
+            if self.recorder.active:
+                self.log('Replay refusé : terminez la capture avant de rejouer')
+                return
+            try:
+                recording=self.recording_store.load()
+                if recording is None:
+                    raise ValueError('Aucun enregistrement ; utilisez Enregistrer puis Terminer')
+                # Offline ONLY. No call to Scheduler / x11 / SMTP here.
+                self.simulation_result=replay(self.graph,recording,self.proof_store,
+                    quota_approved=bool(self.simulation_approved and self.simulation_approved.get_active()))
+                lines=self.simulation_result.lines()
+                self.recording_status.set_text('Replay : '+self.simulation_result.outcome+
+                    ' · '+str(len(recording['frames']))+' états')
+                self.recording_status.set_tooltip_text('Relecture hors ligne ; '+lines[-1])
+                if self.trace_widget is not None:
+                    self.trace_widget.get_buffer().set_text('\n'.join(lines))
+                    self._shown_trace_revision=self.runner.trace.revision
+                if self.timeline_reload:self.timeline_reload()
+                self.log('Replay temporel hors ligne : '+self.simulation_result.outcome)
+            except (ValueError,OSError) as exc:
+                self.simulation_result=None
+                self.log('Replay refusé : '+str(exc))
+            self.refresh()
+
+        def clear_recording(self,*_):
+            dialog=Adw.MessageDialog.new(self.window,'Effacer la séquence enregistrée ?',
+                'Les résultats OCR booléens et états horodatés seront supprimés de votre ordinateur. Cette action est irréversible.')
+            dialog.add_response('cancel','Annuler')
+            dialog.add_response('clear','Effacer')
+            dialog.set_response_appearance('clear',Adw.ResponseAppearance.DESTRUCTIVE)
+            dialog.set_default_response('cancel')
+            dialog.set_close_response('cancel')
+            def confirmed(_dialog,response):
+                if response!='clear':return
+                if self.recorder.active:
+                    self.log('Terminez d’abord la capture en cours')
+                    return
+                try:
+                    self.recording_store.clear()
+                    self.simulation_result=None
+                    self.recording_status.set_text('Séquence privée effacée')
+                    if self.timeline_reload:self.timeline_reload()
+                    self.log('Enregistrement OCR supprimé localement')
+                except (ValueError,OSError) as exc:
+                    self.log('Suppression refusée : '+str(exc))
+            dialog.connect('response',confirmed)
+            dialog.present()
+
         def run_simulation(self,*_):
             # A preview never calls Scheduler, but keeping live and simulated
             # feedback distinct avoids confusion while a real run is active.
@@ -929,6 +1051,9 @@ def launch():
                 self.log('Simulation refusée : '+str(exc))
 
         def workflow_start(self,*_):
+            if self.recorder.active:
+                self.log('Scénario refusé pendant la capture OCR')
+                return
             self.simulation_result=None
             self._shown_trace_revision=-1
             try:
@@ -945,6 +1070,9 @@ def launch():
                 self.log('Scénario refusé : ' + str(exc))
 
         def workflow_restore(self,*_):
+            if self.recorder.active:
+                self.log('Restauration refusée pendant la capture OCR')
+                return
             try:
                 if self.controls.phase == 'running':
                     self.controls.stop()
@@ -995,6 +1123,9 @@ def launch():
             self.refresh()
 
         def play(self,*_):
+            if self.recorder.active:
+                self.log('Play refusé pendant la capture OCR')
+                return
             if self.runner.phase in ('running','paused','approval'):
                 self.log('Arrêtez le scénario avant de lancer le superviseur classique')
                 return
@@ -1022,6 +1153,9 @@ def launch():
             self.refresh()
 
         def approve(self,*_):
+            if self.recorder.active:
+                self.log('Approbation refusée pendant la capture OCR')
+                return
             if self.runner.approve():
                 self.refresh()
             elif self.engine.pending_approval:
@@ -1076,6 +1210,11 @@ def launch():
                 self.buttons['debug_continue'].set_sensitive(self.debug_mode and self.runner.phase=='paused')
                 self.buttons['breakpoint'].set_sensitive(self.graph.find(self.selected) is not None)
                 self.buttons['ocr_test'].set_sensitive(self.graph.find(self.selected) is not None)
+            if 'record_start' in self.buttons:
+                self.buttons['record_start'].set_sensitive(not self.recorder.active)
+                self.buttons['record_stop'].set_sensitive(self.recorder.active)
+                self.buttons['record_replay'].set_sensitive(not self.recorder.active)
+                self.buttons['record_clear'].set_sensitive(not self.recorder.active)
             if 'force_test' in self.buttons:
                 self.buttons['force_test'].set_sensitive(
                     planned_send(self.graph, self.selected) is not None)
@@ -1089,7 +1228,13 @@ def launch():
 
         def _poll(self):
             try:
-                if self.runner.phase=='running':
+                if self.recorder.active:
+                    recorded=self.recorder.capture(self.engine)
+                    if recorded and self.recording_status is not None:
+                        self.recording_status.set_text('⏺ Capture OCR · '+str(len(self.recorder.frames))+'/'+str(MAX_FRAMES))
+                    if not self.recorder.active and self.recorder.frames:
+                        self.stop_recording()
+                elif self.runner.phase=='running':
                     self.runner.tick()
                 elif self.controls.phase=='running':
                     self.engine.tick()
