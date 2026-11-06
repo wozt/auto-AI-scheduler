@@ -149,7 +149,7 @@ def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12):
     return area
 
 
-def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None, trace=None, breakpoints=None):
+def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None, trace=None, breakpoints=None, simulation=None):
     """Resizable bottom timeline: each ordered node is a time-track clip.
 
     Proof images only load from the user's private, local store.
@@ -175,6 +175,7 @@ def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None, trace=No
     track.set_margin_start(8)
     scroll.set_child(track)
     markers = {}
+    simulation_classes = tuple('scheduler-sim-' + status for status in ('ok','yes','no','would','waiting','blocked'))
     trace_classes = tuple('scheduler-trace-' + status for status in (
         'active', 'waiting', 'ocr_yes', 'ocr_no', 'done', 'paused',
         'blocked', 'timeout', 'attempt', 'response', 'restored'))
@@ -192,6 +193,15 @@ def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None, trace=No
                 frame.remove_css_class(css_class)
             if entry is not None:
                 frame.add_css_class('scheduler-trace-' + entry.status)
+            for css_class in simulation_classes:
+                frame.remove_css_class(css_class)
+            result=simulation() if simulation is not None else None
+            simulated=result.latest.get(ident) if result is not None else None
+            if simulated is not None:
+                frame.add_css_class('scheduler-sim-' + simulated.status)
+                indicator.set_text('🧪 ' + simulated.caption)
+                indicator.set_tooltip_text('Simulation fictive seulement : ' + simulated.reason + '\nAucune action réelle exécutée.')
+                frame.set_tooltip_text('Simulation hors ligne : ' + simulated.reason)
 
     def reload():
         markers.clear()

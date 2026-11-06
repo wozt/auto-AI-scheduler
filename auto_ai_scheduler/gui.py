@@ -13,6 +13,8 @@ from .workflow import NODE_KINDS, WorkflowStore, planned_send
 from .workflow_run import WorkflowRunner
 from .workflow_checkpoint import CheckpointStore
 from .workflow_debug import BreakpointStore, dry_run_ocr
+from .workflow_sim import SimulationInputs, simulate
+from .schedule import parse_local
 from .proofs import ProofStore
 from . import editor
 
@@ -76,6 +78,18 @@ def launch():
             self.breakpoint_store=BreakpointStore()
             self.breakpoints=self.breakpoint_store.load()
             self.debug_mode=False
+            self.simulation_images={}
+            self.simulation_result=None
+            self.simulation_status=None
+            self.simulation_state=None
+            self.simulation_event=None
+            self.simulation_time=None
+            self.simulation_elapsed=None
+            self.simulation_reference=None
+            self.simulation_running=None
+            self.simulation_quota=None
+            self.simulation_deadline=None
+            self.simulation_approved=None
             self.runner=WorkflowRunner(self.engine,self.proof_store,self.log,
                                        checkpoints=self.checkpoint_store)
             self._displayed_step=None
@@ -322,6 +336,75 @@ def launch():
                 ('ocr_test','◉ Test OCR',self.test_selected_ocr,'Tester seulement la preuve OCR sélectionnée : aucun prompt envoyé, aucune avancée.'),
             ):
                 self.button(debug_bar,key,label,callback,help_text)
+            # Offline assumptions and replay controls live WITHIN the bottom
+            # resizable timeline, not in a separate application window.
+            simulator=Gtk.Expander(label='🧪 Simulation complète · hors ligne / aucun envoi')
+            simulator.set_tooltip_text('Rejoue le graphe avec des hypothèses et des captures privées. Aucune connexion à Devin, aucun prompt, aucune avancée du vrai scénario.')
+            lower.append(simulator)
+            simbox=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=3)
+            simulator.set_child(simbox)
+            simview=Gtk.ScrolledWindow()
+            simview.set_policy(Gtk.PolicyType.AUTOMATIC,Gtk.PolicyType.NEVER)
+            simview.set_propagate_natural_width(False)
+            simview.set_min_content_width(520)
+            simbox.append(simview)
+            simrow=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=5)
+            simview.set_child(simrow)
+            simrow.append(Gtk.Label(label='Codex :'))
+            states=['UNKNOWN','READY','RUNNING','FINISHED','QUOTA','ERROR']
+            self.simulation_state=Gtk.DropDown.new_from_strings(states)
+            self.simulation_state.set_tooltip_text('État hypothétique de Codex pour le scénario simulé. UNKNOWN ne donne aucune preuve.')
+            simrow.append(self.simulation_state)
+            simrow.append(Gtk.Label(label='Événement :'))
+            events=['(aucun)','cycle_finished','quota','error','ready']
+            self.simulation_event=Gtk.DropDown.new_from_strings(events)
+            self.simulation_event.set_tooltip_text('Événement fictif injecté dans le scénario ; fin de cycle exige aussi RUNNING déjà observé.')
+            simrow.append(self.simulation_event)
+            simrow.append(Gtk.Label(label='Horloge :'))
+            self.simulation_time=Gtk.Entry(text=datetime.now().strftime('%Y-%m-%d %H:%M'))
+            self.simulation_time.set_width_chars(16)
+            self.simulation_time.set_tooltip_text('Heure simulée locale au format AAAA-MM-JJ HH:MM ; ne règle pas l’horloge du PC.')
+            simrow.append(self.simulation_time)
+            simrow.append(Gtk.Label(label='Écoulé (s) :'))
+            self.simulation_elapsed=Gtk.SpinButton.new_with_range(0,86400,1)
+            self.simulation_elapsed.set_width_chars(5)
+            self.simulation_elapsed.set_tooltip_text('Temps fictif écoulé pour les blocs Délai et Attendre.')
+            simrow.append(self.simulation_elapsed)
+            simview2=Gtk.ScrolledWindow()
+            simview2.set_policy(Gtk.PolicyType.AUTOMATIC,Gtk.PolicyType.NEVER)
+            simview2.set_propagate_natural_width(False)
+            simview2.set_min_content_width(520)
+            simbox.append(simview2)
+            simrow2=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=7)
+            simview2.set_child(simrow2)
+            self.simulation_running=Gtk.CheckButton(label='RUNNING observé')
+            self.simulation_running.set_tooltip_text('Hypothèse nécessaire pour simuler un événement « cycle_finished ».')
+            simrow2.append(self.simulation_running)
+            self.simulation_reference=Gtk.CheckButton(label='Référence = observation (démo)')
+            self.simulation_reference.set_tooltip_text('Utilise les captures de référence comme observations simulées. Un succès dans ce mode ne prouve RIEN sur Devin actuellement.')
+            simrow2.append(self.simulation_reference)
+            self.simulation_quota=Gtk.CheckButton(label='Quota déjà vu')
+            self.simulation_quota.set_tooltip_text('Déclare fictivement que le quota a été observé. Une échéance précise reste obligatoire.')
+            simrow2.append(self.simulation_quota)
+            self.simulation_deadline=Gtk.Entry()
+            self.simulation_deadline.set_width_chars(16)
+            self.simulation_deadline.set_placeholder_text('Échéance quota AAAA-MM-JJ HH:MM')
+            self.simulation_deadline.set_tooltip_text('Heure de réinitialisation fictive ; champ vide = inconnue, donc reprise interdite.')
+            simrow2.append(self.simulation_deadline)
+            self.simulation_approved=Gtk.CheckButton(label='Approbation fictive')
+            self.simulation_approved.set_tooltip_text('Simule une approbation manuelle de quota. N’approuve aucun vrai envoi.')
+            simrow2.append(self.simulation_approved)
+            simrow3=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=6)
+            simbox.append(simrow3)
+            self.button(simrow3,'sim_observation','📷 Importer observation',self.select_simulation_observation,
+                        'Associer une capture locale au bloc OCR ou Si/Sinon sélectionné. La copie reste privée, hors Git.')
+            self.button(simrow3,'sim_run','▶ Simuler (aucune action)',self.run_simulation,
+                        'Évaluer toutes les étapes et la branche choisie. Ne modifie pas le scénario réel et ne contacte jamais Devin.')
+            self.simulation_status=Gtk.Label(label='Prêt · aucune simulation lancée',xalign=0)
+            self.simulation_status.set_hexpand(True)
+            self.simulation_status.set_ellipsize(Pango.EllipsizeMode.END)
+            self.simulation_status.set_tooltip_text('Résultat de la dernière simulation, uniquement en mémoire ; aucune capture ou OCR brut dans les logs.')
+            simrow3.append(self.simulation_status)
             self.runner_label=Gtk.Label(label='Scénario inactif',xalign=1)
             self.runner_label.set_hexpand(True)
             self.runner_label.set_ellipsize(Pango.EllipsizeMode.END)
@@ -375,9 +458,15 @@ def launch():
         def _timeline_components(self):
             return editor.timeline_widget(Gtk,self.graph,self.proof_store,self.select_node,
                                           active_id=lambda: self.runner.current.id if self.runner.phase in ('running','paused','approval') and self.runner.current else None,
-                                          trace=self.runner.trace, breakpoints=lambda: self.breakpoints)
+                                           trace=self.runner.trace, breakpoints=lambda: self.breakpoints,
+                                           simulation=lambda:self.simulation_result)
 
         def graph_changed(self):
+            # A modified graph invalidates an old, read-only preview.
+            self.simulation_result=None
+            self.simulation_images={ident:proof for ident,proof in self.simulation_images.items()
+                                    if self.graph.find(ident) is not None}
+            self._shown_trace_revision=-1
             valid={n.id for n in self.graph.nodes}
             if self.breakpoints - valid:
                 self.breakpoints.intersection_update(valid)
@@ -781,7 +870,67 @@ def launch():
                 self.log('Test OCR refusé : '+str(exc))
             self.refresh()
 
+        def select_simulation_observation(self,*_):
+            node=self.graph.find(self.selected) if self.selected else None
+            if node is None or not (node.kind=='ocr' or
+                (node.kind=='branch' and node.params.get('source')=='ocr')):
+                self.log('Simulation : sélectionnez un bloc OCR ou Si/Sinon en mode OCR')
+                return
+            dialog=Gtk.FileDialog(title='Capture d’observation pour la simulation (privée)')
+            def done(d,result):
+                try:
+                    selected=d.open_finish(result)
+                    if not selected:return
+                    proof_id=self.proof_store.import_image(selected.get_path())
+                    self.simulation_images[node.id]=proof_id
+                    self.simulation_result=None
+                    self._shown_trace_revision=-1
+                    if self.timeline_reload:self.timeline_reload()
+                    self.log('Capture d’observation fictive importée pour le bloc '+node.label)
+                except Exception as exc:
+                    self.log('Import simulation refusé : '+str(exc))
+            dialog.open(self.window,None,done)
+
+        def run_simulation(self,*_):
+            # A preview never calls Scheduler, but keeping live and simulated
+            # feedback distinct avoids confusion while a real run is active.
+            if self.controls.phase=='running' or self.runner.phase in ('running','approval'):
+                self.log('Simulation : arrêtez ou mettez en pause le moteur réel')
+                return
+            try:
+                states=['UNKNOWN','READY','RUNNING','FINISHED','QUOTA','ERROR']
+                events=['','cycle_finished','quota','error','ready']
+                moment=parse_local(self.simulation_time.get_text().strip())
+                raw_deadline=self.simulation_deadline.get_text().strip()
+                deadline=parse_local(raw_deadline) if raw_deadline else None
+                options=SimulationInputs(
+                    codex_state=states[self.simulation_state.get_selected()],
+                    event=events[self.simulation_event.get_selected()],
+                    at=moment,
+                    elapsed_seconds=self.simulation_elapsed.get_value_as_int(),
+                    saw_running=self.simulation_running.get_active(),
+                    use_reference_images=self.simulation_reference.get_active(),
+                    observed=dict(self.simulation_images),
+                    quota_was_seen=self.simulation_quota.get_active(),
+                    quota_deadline=deadline,
+                    quota_approved=self.simulation_approved.get_active())
+                self.simulation_result=simulate(self.graph,self.proof_store,options)
+                lines=self.simulation_result.lines()
+                self.simulation_status.set_text(lines[-1])
+                self.simulation_status.set_tooltip_text('\n'.join(lines))
+                if self.trace_widget is not None:
+                    self.trace_widget.get_buffer().set_text('\n'.join(lines))
+                    self._shown_trace_revision=self.runner.trace.revision
+                if self.timeline_reload:self.timeline_reload()
+                self.log('Simulation hors ligne terminée : '+self.simulation_result.outcome)
+            except (ValueError,OSError) as exc:
+                self.simulation_result=None
+                self.simulation_status.set_text('Simulation refusée : hypothèse ou graphe invalide')
+                self.log('Simulation refusée : '+str(exc))
+
         def workflow_start(self,*_):
+            self.simulation_result=None
+            self._shown_trace_revision=-1
             try:
                 if self.runner.phase == 'paused':
                     self.runner.resume()

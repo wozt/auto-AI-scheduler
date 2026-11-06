@@ -380,3 +380,30 @@ or active quota is a negative result, not permission to proceed.
 
 This change extends the desktop GUI only; it does not run real X11/GTK tests
 on a headless build machine. Before unattended operation, test on KDE/X11.
+
+## Complete offline replay / dry run (patch 0012)
+
+Expand **🧪 Simulation complète** in the bottom timeline. Choose a **hypothetical**
+Codex state, event, local time, elapsed seconds, and optionally a quota-reset
+deadline. Import an **observed sample screenshot** for a selected OCR or
+OCR-branch node with **Importer observation**. Each imported screenshot is stored
+privately in `~/.local/share/auto-ai-scheduler/proofs/`, not in the Git repo.
+Alternatively enable **Référence = observation (démo)** to deliberately treat
+existing reference screenshots as observation fixtures. In this demo mode, an OCR
+success says nothing about the current Devin window.
+
+Click **▶ Simuler (aucune action)** to validate and walk the graph in memory,
+including YES/NO exits, time and event gates, OCR comparisons, quota gates,
+notifications, scroll and prompt blocks. The simulated status of each clip
+appears in the original **bottom timeline**; the left structured journal shows
+only redacted decisions and predicted actions. If a screenshot, clock condition,
+quota history or assumed event is missing, the preview **stops** rather than
+pretending that it saw a negative result. Date/time and event inputs are
+**hypotheses**, not verified observations.
+
+**The simulator never calls X11, Scheduler, SMTP, or window automation actions.**
+It never clicks, types, sends a prompt, triggers a mail, scrolls Devin, changes
+workflow checkpoints, clears real breakpoints or advances the live timeline.
+The existing Force test is **still real** and separate from this preview.
+The preview exists only in app memory and is cleared when the graph changes
+or a live scenario starts. Visual behavior requires KDE/X11 testing.

@@ -32,4 +32,9 @@ def css(font_size):
             '.scheduler-trace-timeout, .scheduler-trace-blocked {border:2px solid #dd6a57;}'
             '.scheduler-trace-attempt {border:2px solid #deae46;}'
             '.scheduler-trace-active, .scheduler-trace-response {border:1px solid #76a3dc;}'
+            '.scheduler-sim-ok, .scheduler-sim-yes {border:1px solid #42a576;}'
+            '.scheduler-sim-no {border:1px solid #b68c54;}'
+            '.scheduler-sim-would {border:2px solid #6e9fd5;}'
+            '.scheduler-sim-waiting {border:2px solid #d7b34b;}'
+            '.scheduler-sim-blocked {border:2px solid #dd6a57;}'
             '.scheduler-root button {min-height:26px;}').encode('utf-8')
