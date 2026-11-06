@@ -20,6 +20,7 @@ from . import workflow_inspect_ui
 from .schedule import parse_local
 from .proofs import ProofStore
 from . import editor
+from .canvas_view import CanvasView
 
 LEFT_SECTIONS = (
     ('Cible X11', ('project', 'app_pattern', 'prompt', 'mode')),
@@ -117,6 +118,8 @@ def launch():
             self.log_box=None
             self.log_widget=None
             self.canvas=None
+            self.canvas_view=CanvasView()
+            self.canvas_zoom_label=None
             self.timeline_reload=None
             self.timeline_update_trace=None
             self.trace_widget=None
@@ -301,16 +304,57 @@ def launch():
 
         def make_canvas(self):
             wrap=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=3)
-            wrap.append(self.section_title('Éditeur visuel','Glisser les blocs ; relier les ports ; sélectionner pour modifier à droite'))
-            viewport=Gtk.ScrolledWindow()
-            viewport.set_hexpand(True)
-            viewport.set_vexpand(True)
-            viewport.set_policy(Gtk.PolicyType.AUTOMATIC,Gtk.PolicyType.AUTOMATIC)
-            self.canvas=editor.canvas_widget(Gtk,self.graph,self.select_node,
-                                             self.graph_changed,self.log,self.cfg['font_size'])
-            viewport.set_child(self.canvas)
-            wrap.append(viewport)
+            wrap.append(self.section_title('Éditeur visuel',
+                'Molette : zoom · Clic milieu ou Espace+glisser : déplacer la vue · Maj/Ctrl : sélection multiple'))
+            bar=Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,spacing=5)
+            wrap.append(bar)
+            for label,factor,tip in (
+                ('−',1/1.2,'Dézoomer autour du centre de la zone visible.'),
+                ('+',1.2,'Zoomer autour du centre de la zone visible.'),
+            ):
+                button=Gtk.Button(label=label)
+                button.set_tooltip_text(tip)
+                button.connect('clicked',lambda _b,scale=factor:self.canvas_zoom(scale))
+                bar.append(button)
+            reset=Gtk.Button(label='100 %')
+            reset.set_tooltip_text('Revenir au zoom 100 % et à la position initiale. Ne déplace aucun bloc.')
+            reset.connect('clicked',lambda *_:self.canvas_reset())
+            bar.append(reset)
+            fit=Gtk.Button(label='Cadrer les blocs')
+            fit.set_tooltip_text('Ajuster zoom et position de la vue pour voir tous les blocs sans modifier le scénario.')
+            fit.connect('clicked',lambda *_:self.canvas_fit())
+            bar.append(fit)
+            self.canvas_zoom_label=Gtk.Label(label='100 %',xalign=1)
+            self.canvas_zoom_label.set_hexpand(True)
+            self.canvas_zoom_label.set_tooltip_text('Zoom du canevas : 45 à 250 %. Sauvegarder le scénario ne sauvegarde pas le point de vue.')
+            bar.append(self.canvas_zoom_label)
+            self.canvas=editor.canvas_widget(
+                Gtk,self.graph,self.select_node,self.graph_changed,self.log,
+                self.cfg['font_size'],view=self.canvas_view,on_view_changed=self.canvas_refresh_zoom)
+            wrap.append(self.canvas)
             return wrap
+
+        def canvas_refresh_zoom(self):
+            if self.canvas_zoom_label is not None:
+                self.canvas_zoom_label.set_text(f'{round(self.canvas_view.zoom*100)} %')
+
+        def canvas_zoom(self,factor):
+            if self.canvas is None:return
+            self.canvas_view.zoom_at(self.canvas_view.zoom*factor,
+                                     self.canvas.get_width()/2,self.canvas.get_height()/2)
+            self.canvas.queue_draw()
+            self.canvas_refresh_zoom()
+
+        def canvas_reset(self):
+            self.canvas_view.reset()
+            if self.canvas:self.canvas.queue_draw()
+            self.canvas_refresh_zoom()
+
+        def canvas_fit(self):
+            if self.canvas is None:return
+            self.canvas_view.fit(self.graph,self.canvas.get_width(),self.canvas.get_height())
+            self.canvas.queue_draw()
+            self.canvas_refresh_zoom()
 
         def make_inspector(self):
             wrap=Gtk.Box(orientation=Gtk.Orientation.VERTICAL,spacing=5)
@@ -525,6 +569,7 @@ def launch():
                 self.breakpoint_store.save(self.breakpoints)
                 self.runner.set_breakpoints(self.breakpoints)
             self.workflow_store.save(self.graph)
+            self.canvas_view.prune(self.graph)
             if self.canvas:self.canvas.queue_draw()
             if self.timeline_reload:self.timeline_reload()
             if self.timeline_update_trace:self.timeline_update_trace()
@@ -537,6 +582,10 @@ def launch():
             self.log('Bloc ajouté : '+node.label)
 
         def select_node(self,ident):
+            if ident is None:
+                self.canvas_view.choose(None)
+            elif ident not in self.canvas_view.selected:
+                self.canvas_view.choose(ident)
             self.selected=ident
             self.update_inspector()
             if self.canvas:self.canvas.queue_draw()

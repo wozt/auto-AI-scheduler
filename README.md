@@ -476,3 +476,30 @@ The GTK layout is designed to stay compact on 1080p screens: the new
 information panels scroll inside the expandable sequence area. Headless
 unit tests cover time alignment, input validation, redaction and zero desktop
 side-effects; actual KDE/GTK behavior still needs live confirmation.
+
+## Fluid multi-select canvas and zoom (patch 0015)
+
+The **central visual editor** now uses a viewport-sized Cairo drawing area,
+not a fixed 1600×1050 canvas that forces scrollbars on smaller panes. The
+**bottom timeline stays pinned and vertically resizable** as before. Its
+separate playback, recording, OCR and debugger functions are unchanged.
+
+- **Mouse wheel**: zoom under the pointer (45–250%); **− / +** zoom around
+  the viewport center. **100 %** resets zoom/pan; **Cadrer les blocs** fits
+  the whole workflow to the available pane size. Zoom/pan are non-persistent
+  camera settings and do not alter any node coordinates or workflow content.
+- **Middle-button drag** or **Space + left drag**: pan the canvas.
+- **Shift/Ctrl + click**: add or remove blocks from the selection; **Ctrl+A**
+  selects all, **Escape** abandons an unfinished connection. Drag the empty
+  canvas to rectangle-select several nodes, then drag any selected node to
+  move the group without breaking relative positions. The graph is saved once
+  after the gesture, not once per intermediate mouse movement.
+- **Connection wires**: stronger colored cubic curves, directional arrows and
+  separately colored OUI/NON branches. The original output-port-to-input-port
+  gesture is preserved. Invalid loops are still rejected by `Workflow.connect`.
+
+The pure-Python viewport model is tested headlessly (coordinates, anchor zoom,
+lasso, group movement, non-mutation of graph during camera changes). GTK events
+are wired on the desktop at runtime; check wheel/pan behavior on your KDE/X11
+setup after applying the patch. No screenshots, prompts, runtime settings or
+OCR transcripts are included in the patch.

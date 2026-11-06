@@ -3,9 +3,8 @@ import math
 from pathlib import Path
 
 from .workflow import NODE_KINDS
+from .canvas_view import CanvasView, NODE_W, NODE_H
 
-NODE_W=218
-NODE_H=88
 PALETTE={'Déclencheur':(0.18,0.35,0.58), 'Condition':(0.50,0.33,0.13),
          'Action':(0.16,0.43,0.30)}
 
@@ -17,137 +16,301 @@ def hit_node(graph, x, y):
     return None
 
 
-def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12):
-    """Direct-manipulation node editor: select, drag, wire output→input."""
-    area=Gtk.DrawingArea()
-    area.set_content_width(1600)
-    area.set_content_height(1050)
+def canvas_widget(Gtk, graph, on_select, on_changed, on_message, font=12, view=None, on_view_changed=None):
+    """GTK4 viewport editor: wheel zoom, pan, lasso, multi-drag and safe wiring.
+
+    Only node dragging mutates workflow positions. Camera/selection never
+    mutate graph data or send X11 commands. The bottom timeline is separate.
+    """
+    from gi.repository import Gdk
+
+    view = view if view is not None else CanvasView()
+    area = Gtk.DrawingArea()
+    # A viewport-sized canvas: pan/zoom are camera transforms, not scrollbars
+    # backed by a fixed 1600x1050 minimum on small KDE window allocations.
+    area.set_content_width(1)
+    area.set_content_height(1)
     area.set_hexpand(True)
     area.set_vexpand(True)
-    pending={'from':None, 'branch':None}
-    drag={'node':None,'x':0,'y':0}
+    area.set_focusable(True)
+    area.set_tooltip_text(
+        'Molette : zoom sous le pointeur · Milieu ou Espace+glisser : déplacer la vue · '
+        'Maj/Ctrl+clic : sélection multiple · Glisser sur le fond : sélection rectangulaire · '
+        'Ctrl+A : tout sélectionner · Échap : annuler une connexion')
+    pending = {'from': None, 'branch': None}
+    pointer = {'x': 200.0, 'y': 160.0, 'space': False}
+    drag = {'mode': None, 'initial': {}, 'start': (0., 0.), 'last': (0., 0.),
+            'rectangle': None, 'additive': False, 'moved': False}
 
-    def draw(area, cr, width, height):
-        cr.set_source_rgb(.12,.13,.15)
+    def modifiers(controller):
+        return bool(controller.get_current_event_state() &
+                    (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK))
+
+    def changed_selection(ident):
+        on_select(ident if ident in view.selected else
+                  next(iter(sorted(view.selected)), None))
+
+    def draw(_area, cr, width, height):
+        cr.set_source_rgb(.12, .13, .15)
         cr.paint()
-        cr.set_source_rgba(.7,.8,.9,.09)
-        for x in range(0,width,30):
-            for y in range(0,height,30):
-                cr.arc(x,y,1.0,0,math.tau)
-                cr.fill()
+        # Grid is world-anchored but screen-clipped and cheap at any zoom.
+        grid = 30.0 * view.zoom
+        first_x = view.pan_x % grid
+        first_y = view.pan_y % grid
+        cr.set_source_rgba(.7, .8, .9, .09)
+        cr.set_line_width(1.)
+        x = first_x
+        while x < width:
+            cr.move_to(x, 0)
+            cr.line_to(x, height)
+            x += grid
+        y = first_y
+        while y < height:
+            cr.move_to(0, y)
+            cr.line_to(width, y)
+            y += grid
+        cr.stroke()
+
+        cr.save()
+        cr.translate(view.pan_x, view.pan_y)
+        cr.scale(view.zoom, view.zoom)
+        cr.select_font_face('Sans', 0, 0)
         for edge in graph.edges:
-            a,b=edge[:2]
-            branch=edge[2] if len(edge)==3 else None
-            x,y=graph.find(a),graph.find(b)
-            if x is None or y is None:continue
-            sx,sy=x.x+NODE_W,x.y+(NODE_H/3 if branch=='yes' else 2*NODE_H/3 if branch=='no' else NODE_H/2)
-            ex,ey=y.x,y.y+NODE_H/2
-            cr.set_source_rgba(.54,.76,.93,.9)
-            cr.set_line_width(3)
-            cr.move_to(sx,sy)
-            cr.curve_to(sx+75,sy,ex-75,ey,ex,ey)
+            a, b = edge[:2]
+            branch = edge[2] if len(edge) == 3 else None
+            src, dst = graph.find(a), graph.find(b)
+            if src is None or dst is None:
+                continue
+            sx, sy = (src.x+NODE_W,
+                      src.y+(NODE_H/3 if branch=='yes' else
+                             2*NODE_H/3 if branch=='no' else NODE_H/2))
+            ex, ey = dst.x, dst.y+NODE_H/2
+            bend = max(35., min(115., abs(ex-sx)*.45))
+            control1 = (sx+bend, sy)
+            control2 = (ex-bend, ey)
+            color = ((.36, .81, .52) if branch == 'yes' else
+                     (.94, .58, .33) if branch == 'no' else (.53, .73, .95))
+            cr.move_to(sx, sy)
+            cr.curve_to(*control1, *control2, ex, ey)
+            cr.set_line_width(5.)
+            cr.set_source_rgba(.04, .08, .12, .85)
+            cr.stroke_preserve()
+            cr.set_source_rgb(*color)
+            cr.set_line_width(2.6)
+            cr.stroke()
+            # Arrow at the input (only a visual cue; edge direction is unchanged).
+            cr.move_to(ex-11., ey-5.)
+            cr.line_to(ex-2., ey)
+            cr.line_to(ex-11., ey+5.)
+            cr.set_line_width(2.3)
             cr.stroke()
             if branch:
-                cr.set_source_rgb(.7,.9,.7) if branch=='yes' else cr.set_source_rgb(.96,.69,.43)
-                cr.set_font_size(max(10,font-2))
-                cr.move_to(sx+9,sy-5)
-                cr.show_text('OUI' if branch=='yes' else 'NON')
+                cr.set_source_rgb(*color)
+                cr.set_font_size(max(10, font-2))
+                cr.move_to(sx+9, sy-8)
+                cr.show_text('OUI' if branch == 'yes' else 'NON')
+
         for n in graph.nodes:
-            r,g,b=PALETTE[NODE_KINDS[n.kind][1]]
-            cr.set_source_rgba(.13,.17,.21,1)
-            cr.rectangle(n.x,n.y,NODE_W,NODE_H)
-            cr.fill()
-            cr.set_source_rgb(r,g,b)
-            cr.rectangle(n.x,n.y,NODE_W,27)
-            cr.fill()
-            cr.set_source_rgba(.75,.83,.89,.5)
-            cr.set_line_width(1)
-            cr.rectangle(n.x+.5,n.y+.5,NODE_W-1,NODE_H-1)
-            cr.stroke()
-            cr.set_source_rgb(.97,.97,.98)
-            cr.select_font_face('Sans',0,1)
-            cr.set_font_size(font+2)
-            cr.move_to(n.x+10,n.y+19)
-            cr.show_text(n.label)
-            cr.select_font_face('Sans',0,0)
-            cr.set_font_size(max(10,font-2))
-            cr.move_to(n.x+10,n.y+49)
-            summary=' · '.join(str(v) for v in list(n.params.values())[:2])[:28]
-            cr.show_text(summary)
-            cr.set_source_rgb(.78,.81,.84)
-            cr.arc(n.x,n.y+NODE_H/2,5,0,math.tau)
-            cr.fill()
-            if n.kind=='branch':
-                for label,dy,color in [('OUI',NODE_H/3,(.43,.84,.58)),('NON',NODE_H*2/3,(.94,.59,.31))]:
-                    cr.set_source_rgb(*color)
-                    cr.arc(n.x+NODE_W,n.y+dy,6,0,math.tau)
-                    cr.fill()
-                    cr.set_font_size(max(9,font-3))
-                    cr.move_to(n.x+NODE_W-35,n.y+dy+4)
-                    cr.show_text(label)
-            else:
-                cr.set_source_rgb(.43,.84,.58)
-                cr.arc(n.x+NODE_W,n.y+NODE_H/2,6,0,math.tau)
+            r, g, b = PALETTE[NODE_KINDS[n.kind][1]]
+            selected = n.id in view.selected
+            if selected:
+                cr.set_source_rgba(.35, .77, 1., .24)
+                cr.rectangle(n.x-5, n.y-5, NODE_W+10, NODE_H+10)
                 cr.fill()
-            if pending['from']==n.id:
-                cr.set_source_rgb(1,.93,.4)
-                cr.arc(n.x+NODE_W,n.y+(NODE_H/3 if pending.get('branch')=='yes' else 2*NODE_H/3 if pending.get('branch')=='no' else NODE_H/2),10,0,math.tau)
-                cr.stroke()
+            cr.set_source_rgb(.13, .17, .21)
+            cr.rectangle(n.x, n.y, NODE_W, NODE_H)
+            cr.fill()
+            cr.set_source_rgb(r, g, b)
+            cr.rectangle(n.x, n.y, NODE_W, 27)
+            cr.fill()
+            cr.set_source_rgb(.48, .85, 1.) if selected else cr.set_source_rgba(.75, .83, .89, .5)
+            cr.set_line_width(2.5 if selected else 1.)
+            cr.rectangle(n.x+.5, n.y+.5, NODE_W-1, NODE_H-1)
+            cr.stroke()
+            cr.set_source_rgb(.97, .97, .98)
+            cr.select_font_face('Sans', 0, 1)
+            cr.set_font_size(font+2)
+            cr.move_to(n.x+10, n.y+19)
+            cr.show_text(n.label)
+            cr.select_font_face('Sans', 0, 0)
+            cr.set_font_size(max(10, font-2))
+            cr.move_to(n.x+10, n.y+49)
+            summary = ' · '.join(str(v) for v in list(n.params.values())[:2])[:28]
+            cr.show_text(summary)
+            cr.set_source_rgb(.78, .81, .84)
+            cr.arc(n.x, n.y+NODE_H/2, 5, 0, math.tau)
+            cr.fill()
+            ports = (('yes', NODE_H/3, (.43, .84, .58)),
+                     ('no', NODE_H*2/3, (.94, .59, .31))) if n.kind == 'branch' else (
+                     (None, NODE_H/2, (.43, .84, .58)),)
+            for label, dy, color in ports:
+                cr.set_source_rgb(*color)
+                cr.arc(n.x+NODE_W, n.y+dy, 6, 0, math.tau)
+                cr.fill()
+                if label:
+                    cr.set_font_size(max(9, font-3))
+                    cr.move_to(n.x+NODE_W-35, n.y+dy+4)
+                    cr.show_text('OUI' if label == 'yes' else 'NON')
+                if pending['from'] == n.id and pending['branch'] == label:
+                    cr.set_source_rgb(1., .93, .4)
+                    cr.arc(n.x+NODE_W, n.y+dy, 10, 0, math.tau)
+                    cr.set_line_width(2)
+                    cr.stroke()
+        cr.restore()
+
+        # Lasso is in screen space, so its border is always crisp at all zooms.
+        if drag['rectangle'] is not None:
+            x1, y1, x2, y2 = drag['rectangle']
+            left, top, rw, rh = min(x1, x2), min(y1, y2), abs(x2-x1), abs(y2-y1)
+            cr.set_source_rgba(.35, .65, 1., .14)
+            cr.rectangle(left, top, rw, rh)
+            cr.fill_preserve()
+            cr.set_source_rgba(.58, .83, 1., .95)
+            cr.set_line_width(1.5)
+            cr.set_dash([5., 4.])
+            cr.stroke()
+            cr.set_dash([])
+
     area.set_draw_func(draw)
 
-    def press(gesture,count,x,y):
-        n=hit_node(graph,x,y)
-        if n and x>=n.x+NODE_W-18:
-            pending['from']=n.id
-            pending['branch']=('yes' if y<n.y+NODE_H/2 else 'no') if n.kind=='branch' else None
-            on_message('Connexion : sortie ' + (pending['branch'] or 'unique') + ' → port gauche de destination')
-        elif n and x<=n.x+18 and pending['from']:
+    motion = Gtk.EventControllerMotion()
+    motion.connect('motion', lambda _c,x,y: pointer.update(x=x,y=y))
+    area.add_controller(motion)
+
+    def wheel(_controller, _dx, dy):
+        view.wheel(dy, pointer['x'], pointer['y'])
+        if on_view_changed is not None:
+            on_view_changed()
+        area.queue_draw()
+        return True
+
+    scroll = Gtk.EventControllerScroll.new(Gtk.EventControllerScrollFlags.VERTICAL)
+    scroll.connect('scroll', wheel)
+    area.add_controller(scroll)
+
+    def press(gesture, _count, sx, sy):
+        area.grab_focus()
+        pointer.update(x=sx,y=sy)
+        if pointer['space']:
+            return
+        wx, wy = view.screen_to_world(sx, sy)
+        n = view.hit(graph, sx, sy)
+        if n is not None and wx >= n.x+NODE_W-18:
+            pending['from'] = n.id
+            pending['branch'] = ('yes' if wy<n.y+NODE_H/2 else 'no') if n.kind == 'branch' else None
+            on_message('Connexion : sortie '+(pending['branch'] or 'unique')+' → port gauche de destination')
+        elif n is not None and wx <= n.x+18 and pending['from']:
             try:
-                graph.connect(pending['from'],n.id,branch=pending['branch'])
+                graph.connect(pending['from'], n.id, branch=pending['branch'])
                 on_changed()
                 on_message('Blocs connectés')
             except ValueError as exc:
                 on_message(str(exc))
-            pending['from']=None
-            pending['branch']=None
-        elif n:
-            on_select(n.id)
+            pending.update({'from': None, 'branch': None})
+        elif n is not None:
+            view.choose(n.id, modifiers(gesture))
+            changed_selection(n.id)
         else:
-            pending['from']=None
-            pending['branch']=None
-            on_select(None)
+            pending.update({'from': None, 'branch': None})
+            view.choose(None, modifiers(gesture))
+            changed_selection(None)
         area.queue_draw()
 
-    click=Gtk.GestureClick()
-    click.connect('pressed',press)
+    click = Gtk.GestureClick()
+    click.set_button(1)
+    click.connect('pressed', press)
     area.add_controller(click)
 
-    def begin(gesture,x,y):
-        n=hit_node(graph,x,y)
-        drag['node']=n if n and x<n.x+NODE_W-18 and x>n.x+18 else None
-        if drag['node'] is not None:
-            drag['x']=n.x;drag['y']=n.y
-            on_select(n.id)
-
-    def update(gesture,dx,dy):
-        n=drag['node']
-        if n is None:return
-        n.x=max(20,min(2500,round(drag['x']+dx)))
-        n.y=max(20,min(2500,round(drag['y']+dy)))
+    def begin(gesture, sx, sy):
+        drag.update(mode=None, initial={}, start=(sx,sy), last=(0.,0.),
+                    rectangle=None, additive=modifiers(gesture), moved=False)
+        if pointer['space']:
+            drag['mode'] = 'pan'
+            return
+        node = view.hit(graph,sx,sy)
+        if node is not None:
+            wx, wy = view.screen_to_world(sx, sy)
+            if wx <= node.x+18 or wx >= node.x+NODE_W-18:
+                return
+            if node.id not in view.selected:
+                view.choose(node.id, additive=drag['additive'])
+                changed_selection(node.id)
+            if node.id in view.selected:
+                drag['mode'] = 'nodes'
+                drag['initial'] = {n.id:(n.x,n.y) for n in graph.nodes if n.id in view.selected}
+        else:
+            drag['mode'] = 'rectangle'
+            drag['rectangle'] = (sx, sy, sx, sy)
         area.queue_draw()
 
-    def finish(gesture,dx,dy):
-        if drag['node'] is not None:
-            on_changed()
-            drag['node']=None
+    def update(_gesture, dx, dy):
+        mode = drag['mode']
+        if mode == 'nodes':
+            drag['moved'] |= view.move_selection(graph, drag['initial'], dx, dy)
+        elif mode == 'pan':
+            lx, ly = drag['last']
+            view.pan_by(dx-lx, dy-ly)
+            drag['last'] = (dx,dy)
+        elif mode == 'rectangle':
+            sx, sy = drag['start']
+            drag['rectangle'] = (sx,sy,sx+dx,sy+dy)
+        area.queue_draw()
 
-    mover=Gtk.GestureDrag()
-    mover.connect('drag-begin',begin)
-    mover.connect('drag-update',update)
-    mover.connect('drag-end',finish)
+    def finish(_gesture, dx, dy):
+        mode = drag['mode']
+        if mode == 'nodes' and drag['moved']:
+            on_changed()   # One workflow save for the entire grouped gesture.
+        elif mode == 'rectangle' and dx*dx+dy*dy > 16:
+            sx, sy = drag['start']
+            view.rectangle(graph, (sx,sy), (sx+dx,sy+dy), additive=drag['additive'])
+            changed_selection(None)
+        drag['mode'] = None
+        drag['rectangle'] = None
+        area.queue_draw()
+
+    mover = Gtk.GestureDrag()
+    mover.set_button(1)
+    mover.connect('drag-begin', begin)
+    mover.connect('drag-update', update)
+    mover.connect('drag-end', finish)
     area.add_controller(mover)
-    return area
 
+    def middle_begin(_gesture, x, y):
+        drag['last'] = (0.,0.)
+    def middle_update(_gesture, dx, dy):
+        lx, ly = drag['last']
+        view.pan_by(dx-lx,dy-ly)
+        drag['last'] = (dx,dy)
+        area.queue_draw()
+    middle = Gtk.GestureDrag()
+    middle.set_button(2)
+    middle.connect('drag-begin', middle_begin)
+    middle.connect('drag-update', middle_update)
+    area.add_controller(middle)
+
+    def key_pressed(_controller, key, _keycode, state):
+        if key == Gdk.KEY_space:
+            pointer['space'] = True
+            return True
+        if key == Gdk.KEY_Escape:
+            pending.update({'from': None, 'branch': None})
+            drag['rectangle'] = None
+            area.queue_draw()
+            return True
+        if key in (Gdk.KEY_a,Gdk.KEY_A) and state & Gdk.ModifierType.CONTROL_MASK:
+            view.selected = {n.id for n in graph.nodes}
+            changed_selection(None)
+            area.queue_draw()
+            return True
+        return False
+    def key_released(_controller, key, _keycode, _state):
+        if key == Gdk.KEY_space:
+            pointer['space'] = False
+    keys = Gtk.EventControllerKey()
+    keys.connect('key-pressed', key_pressed)
+    keys.connect('key-released', key_released)
+    area.add_controller(keys)
+    return area
 
 def timeline_widget(Gtk, graph, proof_store, on_select, active_id=None, trace=None, breakpoints=None, simulation=None):
     """Resizable bottom timeline: each ordered node is a time-track clip.
